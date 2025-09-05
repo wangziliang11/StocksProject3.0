@@ -1,0 +1,11 @@
+version: 1
+
+# 模型路由注册：可将环境无关的路由配置放在此文件
+# 本地覆盖请使用 routing.local.yaml（已在 .gitignore 中）
+routing:
+  default:
+    provider: openai_compat
+    model: gpt-4o-mini
+  analysis:
+    provider: deepseek
+    model: deepseek-chat

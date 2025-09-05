@@ -1,0 +1,54 @@
+version: 1
+providers:
+  siliconflow:
+    type: openai
+    base_url: https://api.siliconflow.cn/v1
+    api_key: null  # 请在 models.local.yaml 配置
+  doubao:
+    type: openai
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    api_key: null  # 请在 models.local.yaml 配置
+  qwen:
+    type: openai
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key: null  # 请在 models.local.yaml 配置
+  openai_compat:
+    type: openai
+    base_url: "https://api.openai.com"  # 可被本地覆盖
+  dashscope:
+    type: openai
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  deepseek:
+    type: openai
+    base_url: "https://api.deepseek.com"
+
+models:
+  - name: Qwen/Qwen2.5-7B-Instruct
+    provider: siliconflow
+  - name: ep-xxxxxxxx  # 请替换为你的推理接入点ID
+    provider: doubao
+  - name: qwen-turbo
+    provider: qwen
+  - name: gpt-4o-mini
+    provider: openai_compat
+  - name: qwen2.5-7b-instruct
+    provider: dashscope
+  - name: deepseek-chat
+    provider: deepseek
+
+routing:
+  default:
+    provider: siliconflow
+    model: Qwen/Qwen2.5-7B-Instruct
+  fast:
+    provider: doubao
+    model: ep-xxxxxxxx
+  qwen:
+    provider: qwen
+    model: qwen-turbo
+  fallback:
+    provider: openai_compat
+    model: gpt-4o-mini
+  analysis:
+    provider: deepseek
+    model: deepseek-chat
