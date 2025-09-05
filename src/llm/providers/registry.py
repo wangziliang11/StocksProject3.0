@@ -11,6 +11,8 @@ class ProviderConfig:
     type: str  # 'openai' (OpenAI-compatible)
     base_url: str
     api_key: Optional[str] = None
+    # 新增：可选代理配置（requests 兼容的 proxies 字典），例如 {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+    proxies: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -55,11 +57,34 @@ class ProviderRegistry:
             merged = dict(pconf)
             if pname in prov_loc:
                 merged.update({k: v for k, v in prov_loc[pname].items() if v is not None})
+            # 解析代理配置：优先读取 providers.<name>.proxies，其次读取 http_proxy/https_proxy/no_proxy
+            proxies_cfg: Optional[Dict[str, str]] = None
+            loc_section = prov_loc.get(pname, {}) if isinstance(prov_loc, dict) else {}
+            if isinstance(loc_section, dict):
+                if isinstance(loc_section.get("proxies"), dict):
+                    # 直接使用 proxies 字段
+                    proxies_cfg = {k: v for k, v in loc_section.get("proxies", {}).items() if isinstance(v, str) and v}
+                else:
+                    http_p = loc_section.get("http_proxy")
+                    https_p = loc_section.get("https_proxy")
+                    no_p = loc_section.get("no_proxy")
+                    tmp: Dict[str, str] = {}
+                    if isinstance(http_p, str) and http_p:
+                        tmp["http"] = http_p
+                    if isinstance(https_p, str) and https_p:
+                        tmp["https"] = https_p
+                    if isinstance(no_p, str) and no_p:
+                        # 非标准键，用于在运行时写入环境变量 NO_PROXY
+                        tmp["no_proxy"] = no_p
+                    if tmp:
+                        proxies_cfg = tmp
+
             self.providers[pname] = ProviderConfig(
                 name=pname,
                 type=merged.get("type", "openai"),
                 base_url=merged.get("base_url", ""),
                 api_key=merged.get("api_key"),
+                proxies=proxies_cfg,
             )
 
         # routes：合并顺序 => models.yaml.routing -> routing.yaml -> models.local.yaml.routing -> routing.local.yaml
@@ -85,11 +110,12 @@ class ProviderRegistry:
 
 
 class OpenAICompatClient:
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: int = 30):
+    def __init__(self, base_url: str, api_key: str, model: str, timeout: int = 30, proxies: Optional[Dict[str, str]] = None):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        self.proxies = proxies
         self.headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
     def chat(self, messages: List[Dict[str, str]], tools: Optional[List[Dict[str, Any]]] = None, tool_choice: Optional[str] = None, extra: Optional[Dict] = None) -> Dict:
@@ -102,7 +128,7 @@ class OpenAICompatClient:
                 payload["tool_choice"] = tool_choice
         if extra:
             payload.update(extra)
-        resp = requests.post(url, headers=self.headers, json=payload, timeout=self.timeout)
+        resp = requests.post(url, headers=self.headers, json=payload, timeout=self.timeout, proxies=self.proxies)
         resp.raise_for_status()
         return resp.json()
 
@@ -117,7 +143,14 @@ class LLMRouter:
         self.route = registry.get_route(route_name)
         self.provider = registry.get_provider(self.route.provider)
         assert self.provider.api_key, f"Provider {self.provider.name} api_key 未配置，请在 models.local.yaml 设置"
-        self.client = OpenAICompatClient(base_url=self.provider.base_url, api_key=self.provider.api_key, model=self.route.model)
+        # 处理 no_proxy：如果在本地配置中提供，则写入环境变量供 requests/urllib3 使用
+        proxies = None
+        if self.provider.proxies:
+            proxies = {k: v for k, v in self.provider.proxies.items() if k in ("http", "https", "all")}
+            no_proxy_val = self.provider.proxies.get("no_proxy") if isinstance(self.provider.proxies, dict) else None
+            if isinstance(no_proxy_val, str) and no_proxy_val:
+                os.environ["NO_PROXY"] = no_proxy_val
+        self.client = OpenAICompatClient(base_url=self.provider.base_url, api_key=self.provider.api_key, model=self.route.model, proxies=proxies)
 
     def chat(self, messages: List[Dict[str, str]], tools: Optional[List[Dict[str, Any]]] = None, tool_choice: Optional[str] = None, extra: Optional[Dict] = None) -> Dict:
         return self.client.chat(messages=messages, tools=tools, tool_choice=tool_choice, extra=extra)

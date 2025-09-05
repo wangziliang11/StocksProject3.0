@@ -4,8 +4,11 @@ import pandas as pd
 import akshare as ak
 import sys, os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
 import importlib
+import json
+from datetime import datetime, timedelta
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -69,43 +72,57 @@ def get_stock_name_cached(market: str, symbol: str) -> Optional[str]:
         return None
     return None
 
+# -------- 新增：导航与自选股持久化工具 --------
+WATCHLIST_PATH = ROOT / "data" / "watchlist.json"
 
-def main():
-    st.set_page_config(page_title="A/H 股票分析系统", layout="wide")
-    st.title("A/H 股票分析系统")
-    st.caption("数据源：AKShare | 绘图：Plotly | 前端：Streamlit")
+def _ensure_data_dir():
+    (ROOT / "data").mkdir(parents=True, exist_ok=True)
 
-    with st.sidebar:
-        st.header("数据与模型配置")
-        market = st.selectbox("市场", ["A", "H"], index=0)
-        symbol = st.text_input("股票代码", value="600519" if market == "A" else "00700")
-        period = st.selectbox("周期", ["daily", "weekly", "monthly", "quarterly", "yearly"], index=0)
-        start = st.text_input("开始日期(YYYYMMDD)", value="20180101")
-        end = st.text_input("结束日期(YYYYMMDD)", value="20251231")
-        adjust = st.selectbox("复权(A股)", [None, "qfq", "hfq"], index=0) if market=="A" else None
-        st.subheader("缓存控制")
-        use_cache = st.checkbox("使用缓存", value=True, help="读取/写入 data/cache 缓存")
-        refresh = st.checkbox("强制刷新", value=False, help="忽略过期策略，重新拉取并覆盖缓存")
-        expire_days = st.number_input("过期天数", min_value=0, max_value=365, value=3, step=1, help="0 表示永不过期")
-        st.divider()
-        st.subheader("指标叠加")
-        show_ma = st.checkbox("显示 MA 均线", value=True)
-        ma_list_str = st.text_input("MA窗口(逗号分隔)", value="5,10,20,60")
-        ma_windows = [int(x) for x in ma_list_str.split(',') if x.strip().isdigit()] if show_ma else []
-        show_macd = st.checkbox("显示 MACD", value=False)
-        st.divider()
-        st.subheader("大模型(可选)")
-        st.caption("直连使用 models.local.yaml 中的 API Key；如未配置则回退到路由(models.yaml/routing.yaml)。")
-        provider_label = st.selectbox("提供商", ["硅基流动", "豆包", "通义千问"], index=0)
-        default_model_map = {
-            "硅基流动": "Qwen/Qwen2.5-7B-Instruct",
-            "豆包": "ep-xxxxxxxx",  # 推理接入点ID
-            "通义千问": "qwen-turbo",
-        }
-        model_ui = st.text_input("模型(或接入点)", value=default_model_map[provider_label])
-        route_name = st.text_input("路由名(route)", value="default")
-        enable_tools = st.checkbox("启用联网工具(Function Calling)", value=True)
-        user_query = st.text_area("问模型：个股/行业信息、策略建议...", value="")
+def load_watchlist() -> List[Dict[str, str]]:
+    _ensure_data_dir()
+    if WATCHLIST_PATH.exists():
+        try:
+            return json.load(open(WATCHLIST_PATH, "r", encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+def save_watchlist(items: List[Dict[str, str]]):
+    _ensure_data_dir()
+    with open(WATCHLIST_PATH, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+
+def go_detail(market: str, symbol: str):
+    st.session_state["detail_market"] = market
+    st.session_state["detail_symbol"] = symbol
+    try:
+        st.switch_page("pages/StockDetail.py")
+    except Exception:
+        st.warning("无法跳转到详情页，请确认已创建 pages/StockDetail.py")
+
+# -------- 详情页所复用的单股页面（原 main）提取为函数 --------
+def single_stock_page():
+    st.header("单只股票查询")
+    # 原 sidebar 中的控件迁移为当前分区内控件
+    c1, c2, c3 = st.columns([1.2, 1, 1])
+    with c1:
+        market = st.selectbox("市场", ["A", "H"], index=st.session_state.get("_ss_market_idx", 0), key="ss_market")
+        st.session_state["_ss_market_idx"] = 0 if market == "A" else 1
+        symbol = st.text_input("股票代码", value=st.session_state.get("detail_symbol", "600519" if market == "A" else "00700"))
+    with c2:
+        period = st.selectbox("周期", ["daily", "weekly", "monthly", "quarterly", "yearly"], index=0, key="ss_period")
+        start = st.text_input("开始(YYYYMMDD)", value="20180101")
+        end = st.text_input("结束(YYYYMMDD)", value="20251231")
+    with c3:
+        adjust = st.selectbox("复权(A)", [None, "qfq", "hfq"], index=0, key="ss_adjust") if market == "A" else None
+        use_cache = st.checkbox("使用缓存", value=True)
+        refresh = st.checkbox("强制刷新", value=False)
+        expire_days = st.number_input("过期天数", 0, 365, 3, 1)
+
+    show_ma = st.checkbox("显示 MA 均线", value=True)
+    ma_list_str = st.text_input("MA窗口(逗号分隔)", value="5,10,20,60")
+    ma_windows = [int(x) for x in ma_list_str.split(',') if x.strip().isdigit()] if show_ma else []
+    show_macd = st.checkbox("显示 MACD", value=False)
 
     # 数据获取
     client = AKDataClient()
@@ -119,16 +136,16 @@ def main():
         dmin = pd.to_datetime(df["date"].min()).date()
         dmax = pd.to_datetime(df["date"].max()).date()
         # 快捷按钮
-        c1, c2, c3, c4 = st.columns([1,1,1,4])
-        with c1:
+        c1b, c2b, c3b, c4b = st.columns([1,1,1,4])
+        with c1b:
             if st.button("近30天"):
                 dmin_sel = max(dmin, (pd.to_datetime(dmax) - pd.Timedelta(days=30)).date())
                 st.session_state["disp_range_override"] = (dmin_sel, dmax)
-        with c2:
+        with c2b:
             if st.button("近90天"):
                 dmin_sel = max(dmin, (pd.to_datetime(dmax) - pd.Timedelta(days=90)).date())
                 st.session_state["disp_range_override"] = (dmin_sel, dmax)
-        with c3:
+        with c3b:
             if st.button("近1年"):
                 dmin_sel = max(dmin, (pd.to_datetime(dmax) - pd.Timedelta(days=365)).date())
                 st.session_state["disp_range_override"] = (dmin_sel, dmax)
@@ -162,6 +179,9 @@ def main():
     }
 
     st.subheader(f"历史数据概览 - {stock_name}({symbol})" if stock_name else f"历史数据概览 - {symbol}")
+    # 详情页跳转按钮
+    if st.button("跳转到详情页", key="go_detail_single"):
+        go_detail(market, symbol)
     if df_disp is not None and not df_disp.empty:
         st.dataframe(df_disp.sort_values("date", ascending=False).rename(columns=cn_map).head(200))
     else:
@@ -229,18 +249,66 @@ def main():
     # 大模型问答（通过配置 + 路由 或 直连）
     st.subheader("大模型问答")
     inject_ctx = st.checkbox("将行情/回测摘要注入模型上下文", value=True)
+    user_query = st.text_area("问模型：个股/行业信息、策略建议...", value="")
     if user_query:
         try:
-            # 构造消息
-            sys_prompt = {"role": "system", "content": "你是资深量化分析师。可以结合已知数据做基本面与技术面分析，并提醒数据来源和不构成投资建议。"}
+            sys_prompt = {"role": "system", "content": "你是资深量化分析师。可以结合已知数据做基本面与技术面分析，并提醒数据来源和不构成投资建议。必要时请使用可用的联网工具（function calling）查询个股/行业实时信息，避免臆测。"}
             messages = [sys_prompt]
             if inject_ctx and df_disp is not None and not df_disp.empty:
                 try:
                     latest_close = float(df_disp["close"].iloc[-1])
                     latest_vol = float(df_disp["volume"].iloc[-1]) if pd.notna(df_disp["volume"].iloc[-1]) else 0
                     ctx_lines = [
-                        f"市场: {market}, 代码: {symbol}, 区间: {start}-{end}, 周期: {period}",
-                        f"最新收盘: {latest_close}, 最新成交量: {latest_vol}",
+                        f"市场: {market}",
+                        f"股票代码: {symbol}",
+                        f"最新收盘: {latest_close}",
+                        f"最新成交量: {latest_vol}",
+                    ]
+                    if 'df_ind' in locals():
+                        try:
+                            ctx_lines.append(f"SMA20: {float(df_ind['SMA20'].iloc[-1]):.4f}, SMA60: {float(df_ind['SMA60'].iloc[-1]):.4f}")
+                        except Exception:
+                            pass
+                    if 'res_bt' in locals() and isinstance(res_bt, dict):
+                        try:
+                            ctx_lines.append(
+                                f"回测摘要: 累计收益 {res_bt.get('return',0):.4%}, 最大回撤 {res_bt.get('max_drawdown',0):.4%}, 交易次数 {res_bt.get('trades',0)}"
+                            )
+                        except Exception:
+                            pass
+                    ctx_lines.append("如需查询个股信息，请按市场选择工具：A股用 fetch_stock_info_a，港股用 fetch_stock_info_hk，并传入当前 symbol。")
+                    context_str = "\n".join(ctx_lines)
+                    messages.append({"role": "system", "content": "以下是当前页面上下文，请结合回答问题：\n" + context_str})
+                except Exception:
+                    pass
+            user_msg = {"role": "user", "content": user_query}
+            messages.append(user_msg)
+
+            # 读取路由/模型设置
+            route_name = st.session_state.get("route_name", "default")
+            tools = get_tools_schema()
+            registry = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
+            router = LLMRouter(registry=registry, route_name=route_name)
+
+            result = chat_with_tools(router, messages, tools_schema=tools, max_rounds=3)
+            final_text = result.get("final_text") or ""
+            if final_text.strip():
+                st.markdown(final_text)
+            else:
+                st.write(result.get("raw"))
+        except Exception as e:
+            st.error(f"调用模型失败: {e}")
+    if False and user_query:
+        try:
+            sys_prompt = {"role": "system", "content": "你是资深量化分析师。可以结合已知数据做基本面与技术面分析，并提醒数据来源和不构成投资建议。必要时请使用可用的联网工具（function calling）查询个股/行业实时信息，避免臆测。"}
+            messages = [sys_prompt]
+            if inject_ctx and df_disp is not None and not df_disp.empty:
+                try:
+                    latest_close = float(df_disp["close"].iloc[-1])
+                    latest_vol = float(df_disp["volume"].iloc[-1]) if pd.notna(df_disp["volume"].iloc[-1]) else 0
+                    ctx_lines = [
+                        f"最新收盘: {latest_close}",
+                        f"最新成交量: {latest_vol}",
                     ]
                     if 'df_ind' in locals():
                         try:
@@ -261,14 +329,51 @@ def main():
             user_msg = {"role": "user", "content": user_query}
             messages.append(user_msg)
 
-            tools = get_tools_schema() if enable_tools else None
-
-            # 优先尝试：使用所选提供商直连（从 models.local.yaml 读取 api_key）；若无则回退到路由
+            # 读取路由/模型设置
+            route_name = st.session_state.get("route_name", "default")
+            tools = get_tools_schema()
             registry = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
-            # 后续 LLM 调用与工具派发逻辑...（略）
+            router = LLMRouter(registry, route_name=route_name)
+            messages = [
+                {"role":"system","content":"你是资深行业分析师。给出条理清晰、可执行的行业研判，不构成投资建议。必要时请使用可用的联网工具（function calling）查询个股/行业实时信息。"},
+                {"role":"system","content":"当前行业上下文：\n" + "\n".join(ctx_lines)},
+                {"role":"user","content": prompt},
+            ]
+            tools = get_tools_schema()
+            result = chat_with_tools(router, messages, tools_schema=tools, max_rounds=3)
+            final_text = result.get("final_text") or ""
+            if final_text.strip():
+                st.markdown(final_text)
+            else:
+                st.write(result.get("raw"))
         except Exception as e:
-            st.error(f"调用模型失败: {e}")
+            st.error(f"行业分析失败：{e}")
+    # 重复的行业分析问答块已移除（避免与 industry_page 重复，并消除未定义变量 prompt）
 
+# -------- 新的入口：四大模块 Tabs --------
+def main():
+    st.set_page_config(page_title="A/H 股票分析系统", layout="wide")
+    st.title("A/H 股票分析系统")
+    st.caption("数据源：AKShare | 绘图：Plotly | 前端：Streamlit")
+
+    with st.sidebar:
+        st.header("大模型配置")
+        provider_label = st.selectbox("提供商(路由)", ["default","fast","qwen","fallback","analysis"], index=0, help="使用 routing.yaml 中的路由名", key="provider_route")
+        st.session_state["route_name"] = provider_label
+        st.session_state["enable_tools"] = st.checkbox("启用联网工具(Function Calling)", value=True)
+        st.markdown("—")
+        st.header("导航")
+        st.info("上次筛选/自选/查询的股票可跳转至详情页。")
+
+    tabs = st.tabs(["单股查询", "自选股", "行业信息", "工具筛选"])
+    with tabs[0]:
+        single_stock_page()
+    with tabs[1]:
+        watchlist_page()
+    with tabs[2]:
+        industry_page()
+    with tabs[3]:
+        tools_filter_page()
 
 if __name__ == "__main__":
     main()

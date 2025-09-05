@@ -14,7 +14,7 @@ providers:
     api_key: null  # 请在 models.local.yaml 配置
   openai_compat:
     type: openai
-    base_url: "https://api.openai.com"  # 可被本地覆盖
+    base_url: "https://api.openai.com/v1"  # 可被本地覆盖
   dashscope:
     type: openai
     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
