@@ -23,7 +23,7 @@ providers:
     base_url: "https://api.deepseek.com"
 
 models:
-  - name: Qwen/Qwen2.5-7B-Instruct
+  - name: Qwen/Qwen3-Coder-480B-A35B-Instruct
     provider: siliconflow
   - name: ep-xxxxxxxx  # 请替换为你的推理接入点ID
     provider: doubao

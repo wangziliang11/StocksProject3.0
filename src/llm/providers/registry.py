@@ -3,6 +3,7 @@ from typing import Optional, Dict, List, Any
 import requests
 import yaml
 import os
+import time
 
 
 @dataclass
@@ -13,6 +14,9 @@ class ProviderConfig:
     api_key: Optional[str] = None
     # 新增：可选代理配置（requests 兼容的 proxies 字典），例如 {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
     proxies: Optional[Dict[str, str]] = None
+    # 新增：可配置超时与重试，默认适当增大以避免超时
+    timeout: int = 60
+    retries: int = 2
 
 
 @dataclass
@@ -85,6 +89,8 @@ class ProviderRegistry:
                 base_url=merged.get("base_url", ""),
                 api_key=merged.get("api_key"),
                 proxies=proxies_cfg,
+                timeout=int(merged.get("timeout", 60)),
+                retries=int(merged.get("retries", 2)),
             )
 
         # routes：合并顺序 => models.yaml.routing -> routing.yaml -> models.local.yaml.routing -> routing.local.yaml
@@ -110,12 +116,13 @@ class ProviderRegistry:
 
 
 class OpenAICompatClient:
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: int = 30, proxies: Optional[Dict[str, str]] = None):
+    def __init__(self, base_url: str, api_key: str, model: str, timeout: int = 60, proxies: Optional[Dict[str, str]] = None, retries: int = 2):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
         self.proxies = proxies
+        self.retries = max(0, int(retries))
         self.headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
     def chat(self, messages: List[Dict[str, str]], tools: Optional[List[Dict[str, Any]]] = None, tool_choice: Optional[str] = None, extra: Optional[Dict] = None) -> Dict:
@@ -128,9 +135,19 @@ class OpenAICompatClient:
                 payload["tool_choice"] = tool_choice
         if extra:
             payload.update(extra)
-        resp = requests.post(url, headers=self.headers, json=payload, timeout=self.timeout, proxies=self.proxies)
-        resp.raise_for_status()
-        return resp.json()
+        last_err = None
+        for attempt in range(self.retries + 1):
+            try:
+                resp = requests.post(url, headers=self.headers, json=payload, timeout=self.timeout, proxies=self.proxies)
+                resp.raise_for_status()
+                return resp.json()
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
+                last_err = e
+                if attempt < self.retries:
+                    # 轻量退避，避免 UI 阻塞过久
+                    time.sleep(min(1.5 * (attempt + 1), 4))
+                    continue
+                raise
 
 
 class LLMRouter:
@@ -150,7 +167,14 @@ class LLMRouter:
             no_proxy_val = self.provider.proxies.get("no_proxy") if isinstance(self.provider.proxies, dict) else None
             if isinstance(no_proxy_val, str) and no_proxy_val:
                 os.environ["NO_PROXY"] = no_proxy_val
-        self.client = OpenAICompatClient(base_url=self.provider.base_url, api_key=self.provider.api_key, model=self.route.model, proxies=proxies)
+        self.client = OpenAICompatClient(
+            base_url=self.provider.base_url,
+            api_key=self.provider.api_key,
+            model=self.route.model,
+            timeout=self.provider.timeout,
+            proxies=proxies,
+            retries=self.provider.retries,
+        )
 
     def chat(self, messages: List[Dict[str, str]], tools: Optional[List[Dict[str, Any]]] = None, tool_choice: Optional[str] = None, extra: Optional[Dict] = None) -> Dict:
         return self.client.chat(messages=messages, tools=tools, tool_choice=tool_choice, extra=extra)

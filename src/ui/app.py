@@ -19,6 +19,112 @@ from src.llm.providers.registry import ProviderRegistry, LLMRouter, OpenAICompat
 from src.llm.tools.schema import get_tools_schema
 from src.llm.tools.executor import fetch_stock_info_a, fetch_stock_info_hk
 
+# --- 工具分发映射与自动执行循环 ---
+TOOL_MAP = {
+    "fetch_stock_info_a": fetch_stock_info_a,
+    "fetch_stock_info_hk": fetch_stock_info_hk,
+}
+
+# 仅展示模型答案的工具函数，避免把原始返回（raw JSON）直接渲染到页面
+from typing import Any as _Any
+
+def _extract_text_from_raw(rsp: _Any) -> str:
+    try:
+        if isinstance(rsp, dict):
+            choices = rsp.get("choices") or []
+            if isinstance(choices, list) and choices:
+                msg = choices[0].get("message") or {}
+                if isinstance(msg, dict):
+                    txt = (msg.get("content") or msg.get("reasoning_content") or "")
+                    if txt:
+                        return str(txt)
+            msg = rsp.get("message") or {}
+            if isinstance(msg, dict):
+                txt = (msg.get("content") or msg.get("reasoning_content") or "")
+                if txt:
+                    return str(txt)
+        return ""
+    except Exception:
+        return ""
+
+def _render_llm_answer(result: Dict[str, _Any]):
+    final_text = (result or {}).get("final_text") or ""
+    if isinstance(final_text, str) and final_text.strip():
+        st.markdown(final_text)
+        return
+    fallback = _extract_text_from_raw((result or {}).get("raw"))
+    if fallback.strip():
+        st.markdown(fallback)
+    else:
+        st.warning("模型未返回可读答案，请重试或更换路由/模型。")
+
+def chat_with_tools(router: LLMRouter, messages, tools_schema=None, max_rounds: int = 3):
+    """
+    通用自动工具执行循环：
+    - 使用提供的 router（OpenAI 兼容接口）发送消息
+    - 当模型返回 tool_calls 时，在本地调用 TOOL_MAP 对应函数
+    - 将工具结果作为 tool 消息回传，再次让模型整合，直到产出最终答案或达到轮数上限
+    返回: {"final_text": str, "raw": any}
+    """
+    conv = list(messages)
+    last_raw = None
+    for _ in range(max_rounds):
+        rsp = router.chat(messages=conv, tools=tools_schema, tool_choice="auto")
+        last_raw = rsp
+        # 兼容 OpenAI 风格返回
+        msg = None
+        if isinstance(rsp, dict):
+            choices = rsp.get("choices") or []
+            if choices:
+                msg = choices[0].get("message") or {}
+            else:
+                msg = rsp.get("message") or {}
+        # 无法解析，直接返回原始
+        if not isinstance(msg, dict):
+            return {"final_text": "", "raw": rsp}
+
+        role = msg.get("role", "assistant")
+        content = (msg.get("content") or msg.get("reasoning_content") or "")
+        tool_calls = msg.get("tool_calls") or []
+        # 追加 assistant 回复（可能同时带工具调用）
+        if tool_calls:
+            conv.append({"role": role, "content": content, "tool_calls": tool_calls})
+        else:
+            conv.append({"role": role, "content": content})
+
+        # 若模型触发工具调用，则本地执行
+        if tool_calls:
+            for call in tool_calls:
+                fn_meta = call.get("function", {}) if isinstance(call, dict) else {}
+                fn_name = fn_meta.get("name")
+                raw_args = fn_meta.get("arguments")
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                except Exception:
+                    args = {}
+                tool_fn = TOOL_MAP.get(fn_name)
+                if not tool_fn:
+                    tool_output = {"error": f"unknown tool: {fn_name}"}
+                else:
+                    try:
+                        tool_output = tool_fn(**args)
+                    except Exception as e:
+                        tool_output = {"error": str(e)}
+                conv.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "name": fn_name,
+                    "content": json.dumps(tool_output, ensure_ascii=False)
+                })
+            # 继续下一轮，让模型整合工具结果
+            continue
+        else:
+            # 没有工具调用，认为已给出最终回答
+            return {"final_text": content, "raw": rsp}
+
+    # 达到回合上限，返回最后一次原始结果
+    return {"final_text": content if content else "", "raw": last_raw}
+
 
 # 缓存获取股票名称（A股/港股）
 @st.cache_data(ttl=3600)
@@ -231,6 +337,29 @@ def single_stock_page():
         res_bt = backtest_ma_cross(df_ind, short=20, long=60)
         st.write("回测结果：", res_bt)
 
+        # 新增：一键生成中文总结
+        col_a, col_b = st.columns([1, 4])
+        with col_a:
+            gen_cn = st.button("生成中文总结", use_container_width=True)
+        if gen_cn:
+            try:
+                trades = int(res_bt.get("trades", 0))
+                ret = float(res_bt.get("return", 0.0))
+                mdd = float(res_bt.get("max_drawdown", 0.0))
+                win = float(res_bt.get("win_rate", 0.0))
+                period_txt = {"daily":"日线","weekly":"周线","monthly":"月线","quarterly":"季线","yearly":"年线"}.get(period, str(period))
+                ma_txt = "MA(20/60) 趋势策略：当短均线上穿长均线买入、下穿卖出；适合趋势行情，震荡时容易虚假信号。"
+                summary = (
+                    f"回测基于{period_txt}与所选展示区间。共 {trades} 笔交易，区间累计收益约 {ret:.2%}，最大回撤约 {mdd:.2%}，胜率约 {win:.2%}。\n"
+                    f"直观解读：收益较{'可观' if ret>0 else '一般'}，回撤{'偏高' if mdd>0.25 else '可控'}，胜率{'略低于' if win<0.5 else '高于'} 50%。策略更依赖趋势段与盈亏比，需控制仓位与止损。\n"
+                    f"策略说明：{ma_txt}\n"
+                    f"风控建议：可叠加成交量/RSI/布林带过滤、设置固定或ATR止损、使用多周期共振（周线定方向，{period_txt}择时）。以上仅为方法参考，非投资建议。"
+                )
+                st.success("中文总结已生成：")
+                st.write(summary)
+            except Exception as e:
+                st.warning(f"生成中文总结失败：{e}")
+
         # 绘图
         st.subheader("K线图")
         fig_title = f"{stock_name}({symbol}) K线" if stock_name else f"{symbol} K线"
@@ -259,11 +388,33 @@ def single_stock_page():
                     latest_close = float(df_disp["close"].iloc[-1])
                     latest_vol = float(df_disp["volume"].iloc[-1]) if pd.notna(df_disp["volume"].iloc[-1]) else 0
                     ctx_lines = [
+                        f"页面: 单股查询",
                         f"市场: {market}",
                         f"股票代码: {symbol}",
+                        f"股票名称: {stock_name or ''}",
+                        f"周期: {period}",
+                        f"展示区间: {str(ds)} ~ {str(de)}" if 'ds' in locals() and 'de' in locals() else "展示区间: 未知",
+                        f"MA窗口: {','.join(map(str, ma_windows)) if (isinstance(ma_windows, list) and len(ma_windows)>0) else '关闭'}",
+                        f"MACD: {'开启' if show_macd else '关闭'}",
                         f"最新收盘: {latest_close}",
                         f"最新成交量: {latest_vol}",
                     ]
+                    # 尝试注入行业信息（A股）
+                    if market == "A":
+                        try:
+                            info_df = ak.stock_individual_info_em(symbol=symbol)
+                            if info_df is not None and not info_df.empty:
+                                col0, col1 = info_df.columns[:2]
+                                for key in ["所属行业", "行业", "行业分类", "细分行业"]:
+                                    _row = info_df[info_df[col0].astype(str).str.contains(key, na=False)]
+                                    if not _row.empty:
+                                        ind_name = str(_row[col1].iloc[0])
+                                        if ind_name:
+                                            ctx_lines.append(f"所属行业: {ind_name}")
+                                        break
+                        except Exception:
+                            pass
+                    # 指标与回测摘要
                     if 'df_ind' in locals():
                         try:
                             ctx_lines.append(f"SMA20: {float(df_ind['SMA20'].iloc[-1]):.4f}, SMA60: {float(df_ind['SMA60'].iloc[-1]):.4f}")
@@ -276,7 +427,7 @@ def single_stock_page():
                             )
                         except Exception:
                             pass
-                    ctx_lines.append("如需查询个股信息，请按市场选择工具：A股用 fetch_stock_info_a，港股用 fetch_stock_info_hk，并传入当前 symbol。")
+                    ctx_lines.append("如需查询个股或行业的实时信息，请按市场选择工具：A股用 fetch_stock_info_a，港股用 fetch_stock_info_hk，并传入当前 symbol；热点题材/新闻亦可通过工具检索。")
                     context_str = "\n".join(ctx_lines)
                     messages.append({"role": "system", "content": "以下是当前页面上下文，请结合回答问题：\n" + context_str})
                 except Exception:
@@ -295,7 +446,7 @@ def single_stock_page():
             if final_text.strip():
                 st.markdown(final_text)
             else:
-                st.write(result.get("raw"))
+                _render_llm_answer(result)
         except Exception as e:
             st.error(f"调用模型失败: {e}")
     if False and user_query:
@@ -345,10 +496,104 @@ def single_stock_page():
             if final_text.strip():
                 st.markdown(final_text)
             else:
-                st.write(result.get("raw"))
+                _render_llm_answer(result)
         except Exception as e:
             st.error(f"行业分析失败：{e}")
     # 重复的行业分析问答块已移除（避免与 industry_page 重复，并消除未定义变量 prompt）
+
+# -------- 自选股页面 --------
+def watchlist_page():
+    st.header("自选股")
+    items = load_watchlist()
+
+    with st.form("add_watch_item"):
+        c1, c2, c3 = st.columns([1,1,2])
+        with c1:
+            mkt = st.selectbox("市场", ["A","H"], key="wl_market")
+        with c2:
+            sym = st.text_input("股票代码", key="wl_symbol")
+        submitted = st.form_submit_button("添加到自选")
+        if submitted:
+            sym = (sym or "").strip()
+            if sym:
+                if not any((it.get("market"), it.get("symbol")) == (mkt, sym) for it in items):
+                    items.append({"market": mkt, "symbol": sym})
+                    save_watchlist(items)
+                    st.success("已添加到自选")
+                else:
+                    st.info("自选中已存在该代码")
+            else:
+                st.warning("请输入代码")
+
+    if not items:
+        st.info("暂无自选。可以在上方添加股票代码。")
+        return
+
+    # 展示与操作
+    for i, it in enumerate(list(items)):
+        market = it.get("market")
+        symbol = it.get("symbol")
+        name = get_stock_name_cached(market, symbol)
+        c1, c2, c3, c4 = st.columns([2,2,2,2])
+        c1.write(f"{name or ''} ({symbol})")
+        c2.write(f"市场：{market}")
+        if c3.button("查看", key=f"wl_view_{i}_{market}_{symbol}"):
+            go_detail(market, symbol)
+        if c4.button("删除", key=f"wl_del_{i}_{market}_{symbol}"):
+            items = [x for x in items if not ((x.get('market')==market) and (x.get('symbol')==symbol))]
+            save_watchlist(items)
+            st.experimental_rerun()
+
+
+# -------- 行业信息页面 --------
+def industry_page():
+    st.header("行业信息")
+    kw = st.text_input("行业/主题关键词", value=st.session_state.get("industry_keyword", "半导体"))
+    st.session_state["industry_keyword"] = kw
+    inject_ctx = st.checkbox("注入行业上下文", value=True)
+
+    user_query = st.text_area("问模型：行业逻辑、景气度、龙头比较、估值与风险…", value="")
+    if user_query:
+        try:
+            sys_prompt = {"role":"system","content":"你是资深行业分析师。给出条理清晰、可执行的行业研判，不构成投资建议。必要时请使用可用的联网工具（function calling）查询个股/行业实时信息。"}
+            messages = [sys_prompt]
+            if inject_ctx:
+                ctx_lines = [
+                    "页面: 行业信息",
+                    f"行业关键词: {kw}",
+                    "如需获取成份股或个股数据，可按市场调用工具：A股用 fetch_stock_info_a，港股用 fetch_stock_info_hk。",
+                ]
+                messages.append({"role":"system","content":"以下是当前页面上下文：\n" + "\n".join(ctx_lines)})
+            messages.append({"role":"user","content": user_query})
+
+            route_name = st.session_state.get("route_name","default")
+            registry = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
+            router = LLMRouter(registry=registry, route_name=route_name)
+            tools = get_tools_schema()
+            result = chat_with_tools(router, messages, tools_schema=tools, max_rounds=3)
+            final_text = result.get("final_text") or ""
+            if final_text.strip():
+                st.markdown(final_text)
+            else:
+                _render_llm_answer(result)
+        except Exception as e:
+            st.error(f"行业分析失败：{e}")
+
+
+# -------- 工具筛选页面（示例） --------
+def tools_filter_page():
+    st.header("工具筛选（示例）")
+    st.info("示例：批量把 A 股代码加入自选。逗号分隔输入即可。")
+    codes = st.text_input("A 股代码（逗号分隔）", value="")
+    if st.button("批量加入自选", key="bulk_add_watchlist"):
+        items = load_watchlist()
+        added = 0
+        for sym in [c.strip() for c in codes.split(',') if c.strip()]:
+            if not any((it.get('market'), it.get('symbol')) == ("A", sym) for it in items):
+                items.append({"market":"A","symbol": sym})
+                added += 1
+        save_watchlist(items)
+        st.success(f"已加入 {added} 个代码到自选")
 
 # -------- 新的入口：四大模块 Tabs --------
 def main():
