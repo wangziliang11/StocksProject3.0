@@ -27,8 +27,8 @@
     ├── logic/
     │   └── indicators.py      # 指标与回测逻辑
     ├── llm/
-    │   ├── providers/
-    │   │   └── registry.py    # ProviderRegistry/LLMRouter/OpenAICompatClient
+    │   ├── mcp/
+    │   │   └── adapter.py     # MCPRouter（适配层，占位实现）
     │   └── tools/
     │       ├── schema.py      # Tools Schema（OpenAI tools 规范）
     │       └── executor.py    # Tools 执行器（应用端实际调用）
@@ -97,7 +97,7 @@ streamlit run src/ui/app.py --server.port 8501
   - 路由注册文件（公共/本地），最终合并优先级：
     models.yaml.routing < routing.yaml < models.local.yaml.routing < routing.local.yaml
 
-在代码侧，通过 <mcfile name="registry.py" path="src/llm/providers/registry.py"></mcfile> 中的 <mcsymbol name="ProviderRegistry" filename="registry.py" path="src/llm/providers/registry.py" startline="28" type="class"></mcsymbol> 合并配置，通过 <mcsymbol name="LLMRouter" filename="registry.py" path="src/llm/providers/registry.py" startline="85" type="class"></mcsymbol> 选择路由并统一发起对话。
+在代码侧，已切换为基于 MCP 的调用路径，由 <mcfile name="adapter.py" path="src/llm/mcp/adapter.py"></mcfile> 提供 <mcsymbol name="MCPRouter" filename="adapter.py" path="src/llm/mcp/adapter.py" startline="6" type="class"></mcsymbol> 统一发起对话。
 
 
 ## 数据持久化与重采样
@@ -118,7 +118,7 @@ streamlit run src/ui/app.py --server.port 8501
 
 ## LLM 调用与工具（Function Calling）
 
-- 前端可选择路由名（如 default/analysis），通过 <mcsymbol name="LLMRouter" filename="registry.py" path="src/llm/providers/registry.py" startline="85" type="class"></mcsymbol> 选择 provider 与 model。
+- 前端可选择路由名（如 default/analysis），由 <mcsymbol name="MCPRouter" filename="adapter.py" path="src/llm/mcp/adapter.py" startline="6" type="class"></mcsymbol> 统一转发调用，底层实际模型/工具由 MCP 客户端配置决定（可在 routing.yaml 中登记路由名）。
 - 工具定义：<mcfile name="schema.py" path="src/llm/tools/schema.py"></mcfile>（OpenAI tools 规范）
 - 工具执行：<mcfile name="executor.py" path="src/llm/tools/executor.py"></mcfile>（应用端实际联网查询）
 - Demo 工具：fetch_stock_info_a（东方财富源：个股基本信息）

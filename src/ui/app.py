@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
 from src.data.ak_client import AKDataClient
 from src.logic.indicators import sma, ema, macd, backtest_ma_cross
 from src.viz.charts import kline_with_volume
-from src.llm.providers.registry import ProviderRegistry, LLMRouter, OpenAICompatClient
+from src.llm.mcp.adapter import MCPRouter
 from src.llm.tools.schema import get_tools_schema
 from src.llm.tools.executor import fetch_stock_info_a, fetch_stock_info_hk
 
@@ -58,14 +58,39 @@ def _render_llm_answer(result: Dict[str, _Any]):
     else:
         st.warning("模型未返回可读答案，请重试或更换路由/模型。")
 
-def chat_with_tools(router: LLMRouter, messages, tools_schema=None, max_rounds: int = 3):
+def chat_with_tools(router, messages, tools_schema=None, max_rounds: int = 3):
     """
     通用自动工具执行循环：
-    - 使用提供的 router（OpenAI 兼容接口）发送消息
+    - 使用提供的 router 发送消息（MCP 适配层）
     - 当模型返回 tool_calls 时，在本地调用 TOOL_MAP 对应函数
     - 将工具结果作为 tool 消息回传，再次让模型整合，直到产出最终答案或达到轮数上限
     返回: {"final_text": str, "raw": any}
     """
+    # 动态发现 MCP 工具并并入 schema（若未配置或不可用则返回空列表，自动忽略）
+    try:
+        mcp_tools = router.mcp_list_tools_openai_schema() if hasattr(router, "mcp_list_tools_openai_schema") else []
+    except Exception:
+        mcp_tools = []
+    if tools_schema is None:
+        try:
+            tools_schema = get_tools_schema()
+        except Exception:
+            tools_schema = []
+    # 合并 schema，按函数名去重
+    try:
+        existing = set()
+        for t in tools_schema or []:
+            fn = (t.get("function") or {}).get("name")
+            if fn:
+                existing.add(fn)
+        for t in mcp_tools or []:
+            fn = (t.get("function") or {}).get("name")
+            if fn and fn not in existing:
+                tools_schema.append(t)
+                existing.add(fn)
+    except Exception:
+        pass
+
     conv = list(messages)
     last_raw = None
     for _ in range(max_rounds):
@@ -92,7 +117,7 @@ def chat_with_tools(router: LLMRouter, messages, tools_schema=None, max_rounds: 
         else:
             conv.append({"role": role, "content": content})
 
-        # 若模型触发工具调用，则本地执行
+        # 若模型触发工具调用，则本地执行/或通过 MCP 执行
         if tool_calls:
             for call in tool_calls:
                 fn_meta = call.get("function", {}) if isinstance(call, dict) else {}
@@ -102,14 +127,31 @@ def chat_with_tools(router: LLMRouter, messages, tools_schema=None, max_rounds: 
                     args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
                 except Exception:
                     args = {}
+
+                tool_output = None
                 tool_fn = TOOL_MAP.get(fn_name)
-                if not tool_fn:
-                    tool_output = {"error": f"unknown tool: {fn_name}"}
-                else:
+                if tool_fn:
                     try:
                         tool_output = tool_fn(**args)
                     except Exception as e:
                         tool_output = {"error": str(e)}
+                # 若本地找不到或出错，尝试通过 MCP 调用
+                if tool_output is None or (isinstance(tool_output, dict) and tool_output.get("error")):
+                    try:
+                        if hasattr(router, "mcp_call_tool"):
+                            mres = router.mcp_call_tool(str(fn_name), args)
+                            if isinstance(mres, dict) and mres.get("ok"):
+                                tool_output = mres.get("data")
+                            else:
+                                # 尽量把远端错误透出
+                                err = mres.get("error") if isinstance(mres, dict) else "mcp_call_tool failed"
+                                tool_output = {"error": err}
+                        else:
+                            if tool_output is None:
+                                tool_output = {"error": f"unknown tool: {fn_name}"}
+                    except Exception as e:
+                        tool_output = {"error": f"mcp_call_tool exception: {e}"}
+
                 conv.append({
                     "role": "tool",
                     "tool_call_id": call.get("id"),
@@ -438,8 +480,7 @@ def single_stock_page():
             # 读取路由/模型设置
             route_name = st.session_state.get("route_name", "default")
             tools = get_tools_schema()
-            registry = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
-            router = LLMRouter(registry=registry, route_name=route_name)
+            router = MCPRouter(route_name=route_name)
 
             result = chat_with_tools(router, messages, tools_schema=tools, max_rounds=3)
             final_text = result.get("final_text") or ""
@@ -483,8 +524,7 @@ def single_stock_page():
             # 读取路由/模型设置
             route_name = st.session_state.get("route_name", "default")
             tools = get_tools_schema()
-            registry = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
-            router = LLMRouter(registry, route_name=route_name)
+            router = MCPRouter(route_name=route_name)
             messages = [
                 {"role":"system","content":"你是资深行业分析师。给出条理清晰、可执行的行业研判，不构成投资建议。必要时请使用可用的联网工具（function calling）查询个股/行业实时信息。"},
                 {"role":"system","content":"当前行业上下文：\n" + "\n".join(ctx_lines)},
@@ -567,8 +607,7 @@ def industry_page():
             messages.append({"role":"user","content": user_query})
 
             route_name = st.session_state.get("route_name","default")
-            registry = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
-            router = LLMRouter(registry=registry, route_name=route_name)
+            router = MCPRouter(route_name=route_name)
             tools = get_tools_schema()
             result = chat_with_tools(router, messages, tools_schema=tools, max_rounds=3)
             final_text = result.get("final_text") or ""
@@ -604,6 +643,7 @@ def main():
     with st.sidebar:
         st.header("大模型配置")
         provider_label = st.selectbox("提供商(路由)", ["default","fast","qwen","fallback","analysis"], index=0, help="使用 routing.yaml 中的路由名", key="provider_route")
+        # 同步路由名到 session_state，供各页面使用
         st.session_state["route_name"] = provider_label
         st.session_state["enable_tools"] = st.checkbox("启用联网工具(Function Calling)", value=True)
         st.markdown("—")
