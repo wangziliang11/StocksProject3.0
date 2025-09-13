@@ -372,11 +372,360 @@ def single_stock_page():
             # 回退：直接使用已导入的函数
             fig = kline_with_volume(df_disp, title=fig_title, ma_windows=ma_windows, show_macd=show_macd, period=period)
         st.plotly_chart(fig, use_container_width=True)
+
+        # === 新增：个股详情四项信息 ===
+        st.subheader("个股详情")
+        tab_base, tab_fin, tab_ind, tab_risk = st.tabs(["基本面信息", "最新财报信息", "所属行业信息", "未来三个月风险提示"])
+
+        # 1) 基本面信息
+        with tab_base:
+            try:
+                if market == "A":
+                    base_df = ak.stock_individual_info_em(symbol=symbol)
+                    if base_df is not None and not base_df.empty:
+                        st.dataframe(base_df)
+                    else:
+                        st.info("未获取到 A 股基本面信息。")
+                else:
+                    # 尝试展示港股基本信息：优先实时报价中的基本字段
+                    try:
+                        hk_spot = ak.stock_hk_spot_em()
+                        code_col = None
+                        for c in ["代码", "symbol", "code", "证券代码"]:
+                            if c in hk_spot.columns:
+                                code_col = c
+                                break
+                        if code_col:
+                            sym = str(symbol).upper().replace(".HK", "")
+                            hk_spot["_code_norm"] = hk_spot[code_col].astype(str).str.upper().str.replace(".HK", "", regex=False).str.lstrip("0")
+                            row = hk_spot[hk_spot["_code_norm"] == sym.lstrip("0")].drop(columns=["_code_norm"])  # type: ignore
+                            if not row.empty:
+                                st.dataframe(row)
+                            else:
+                                st.info("未在港股实时报价中找到该代码。")
+                        else:
+                            st.info("港股基本信息暂未适配该数据结构。")
+                    except Exception as e:
+                        st.info(f"无法获取港股基本信息：{e}")
+            except Exception as e:
+                st.warning(f"获取基本面信息失败：{e}")
+
+        # 2) 最新财报信息
+        with tab_fin:
+            ok = False
+            fin_df_used = None
+            if market == "A":
+                # 依次尝试多种接口，兼容不同 akshare 版本
+                for fn in [
+                    getattr(ak, "stock_financial_analysis_indicator", None),
+                    getattr(ak, "stock_financial_report_sina", None),
+                    getattr(ak, "stock_financial_abstract_ths", None),
+                ]:
+                    try:
+                        if fn is None:
+                            continue
+                        fin_df = fn(symbol=symbol)  # type: ignore
+                        if fin_df is not None and not fin_df.empty:
+                            # 新增：按报告期倒排
+                            try:
+                                cand_cols = [
+                                    "报告期", "报表日期", "公告日期", "日期", "报告日期", "endDate", "REPORT_DATE", "REPORTDATE", "截止日期", "period"
+                                ]
+                                col = next((c for c in cand_cols if c in fin_df.columns), None)
+                                if col:
+                                    _tmp = fin_df.copy()
+                                    _tmp["__dt__"] = pd.to_datetime(_tmp[col].astype(str).str.replace("年", "-").str.replace("月", "-").str.replace("日", ""), errors="coerce")
+                                    _tmp = _tmp.sort_values("__dt__", ascending=False, na_position="last").drop(columns=["__dt__"])
+                                    fin_df_used = _tmp
+                                else:
+                                    fin_df_used = fin_df
+                            except Exception:
+                                fin_df_used = fin_df
+                            st.dataframe(fin_df_used)
+                            ok = True
+                            break
+                    except Exception:
+                        continue
+                if not ok:
+                    st.info("未获取到 A 股最新财报信息（可能接口变动或版本不兼容）。")
+            else:
+                # 港股：尝试常见接口，若失败则提示
+                tried = False
+                for name in [
+                    "stock_hk_financial_analysis_indicator_em",
+                    "stock_hk_finance_analysis_em",
+                ]:
+                    fn = getattr(ak, name, None)
+                    if fn is None:
+                        continue
+                    tried = True
+                    try:
+                        fin_df = fn(symbol=symbol)  # type: ignore
+                        if fin_df is not None and not fin_df.empty:
+                            # 新增：按报告期倒排
+                            try:
+                                cand_cols = [
+                                    "报告期", "报表日期", "公告日期", "日期", "报告日期", "endDate", "REPORT_DATE", "REPORTDATE", "截止日期", "period"
+                                ]
+                                col = next((c for c in cand_cols if c in fin_df.columns), None)
+                                if col:
+                                    _tmp = fin_df.copy()
+                                    _tmp["__dt__"] = pd.to_datetime(_tmp[col].astype(str).str.replace("年", "-").str.replace("月", "-").str.replace("日", ""), errors="coerce")
+                                    _tmp = _tmp.sort_values("__dt__", ascending=False, na_position="last").drop(columns=["__dt__"])
+                                    fin_df_used = _tmp
+                                else:
+                                    fin_df_used = fin_df
+                            except Exception:
+                                fin_df_used = fin_df
+                            st.dataframe(fin_df_used)
+                            ok = True
+                            break
+                    except Exception:
+                        continue
+                if not ok:
+                    if tried:
+                        st.info("未获取到港股最新财报信息（接口返回为空或筛选不到该代码）。")
+                    else:
+                        st.info("当前 akshare 版本暂未提供港股财报适配接口。")
+
+            # 新增：(3) 在数据表格后追加财报文字总结（由大模型生成）
+            if ok and fin_df_used is not None and not fin_df_used.empty:
+                with st.expander("生成财报文字总结", expanded=False):
+                    topn = st.slider("纳入总结的最近期数量", min_value=1, max_value=min(8, len(fin_df_used)), value=min(4, len(fin_df_used)))
+                    df_for_sum = fin_df_used.head(topn)
+                    st.dataframe(df_for_sum)
+                    gen_fin_sum = st.button("生成总结", key=f"btn_fin_sum_{market}_{symbol}")
+                    if gen_fin_sum:
+                        try:
+                            # 将表格压缩为 JSON 文本供模型理解
+                            jtxt = df_for_sum.to_json(orient="records", force_ascii=False)
+                            sys_prompt = {"role":"system","content":"你是资深卖方分析师。请基于最近几个财报期的关键指标，给出中文要点总结：收入/利润同比、毛利/净利率趋势、费用趋势、现金流与资产负债变化、分红与指引（如有）、核心风险与看点。避免夸大，不构成投资建议。"}
+                            messages = [sys_prompt, {"role":"system","content":f"股票: {stock_name or ''}({symbol}) | 市场: {market}"}, {"role":"user","content":"以下是最近期财报数据（JSON）：\n" + jtxt}]
+                            route_name = st.session_state.get("route_name", "default")
+                            enable_tools = st.session_state.get("enable_tools", True)
+                            registry = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
+                            router = LLMRouter(registry=registry, route_name=route_name)
+                            tools = get_tools_schema() if enable_tools else None
+                            res = chat_with_tools(router, messages, tools_schema=tools, max_rounds=2)
+                            txt = (res or {}).get("final_text") or ""
+                            if txt.strip():
+                                st.markdown(txt)
+                            else:
+                                _render_llm_answer(res)
+                        except Exception as e:
+                            st.warning(f"生成财报总结失败：{e}")
+
+        # 3) 所属行业信息
+        with tab_ind:
+            try:
+                ind_name = None
+                if market == "A":
+                    try:
+                        info_df = ak.stock_individual_info_em(symbol=symbol)
+                        if info_df is not None and not info_df.empty:
+                            col0, col1 = info_df.columns[:2]
+                            for key in ["所属行业", "行业", "行业分类", "细分行业"]:
+                                _row = info_df[info_df[col0].astype(str).str.contains(key, na=False)]
+                                if not _row.empty:
+                                    ind_name = str(_row[col1].iloc[0])
+                                    break
+                    except Exception:
+                        pass
+                else:
+                    # 简要行业信息：港股尝试从常见列中读取
+                    try:
+                        hk_spot = ak.stock_hk_spot_em()
+                        code_col = None
+                        for c in ["代码", "symbol", "code", "证券代码"]:
+                            if c in hk_spot.columns:
+                                code_col = c
+                                break
+                        if code_col:
+                            sym = str(symbol).upper().replace(".HK", "")
+                            hk_spot["_code_norm"] = hk_spot[code_col].astype(str).str.upper().str.replace(".HK", "", regex=False).str.lstrip("0")
+                            row = hk_spot[hk_spot["_code_norm"] == sym.lstrip("0")]
+                            # 在行情表里尝试常见行业列名
+                            for candi in ["行业", "所属行业", "板块", "行业分类"]:
+                                if candi in row.columns and not row.empty:
+                                    val = str(row.iloc[0][candi])
+                                    if val and val != "nan":
+                                        ind_name = val
+                                        break
+                    except Exception:
+                        pass
+                if ind_name:
+                    st.success(f"所属行业：{ind_name}")
+                    # 新增：(2) 调用大模型生成行业上中下游与龙头总结
+                    with st.expander("生成行业产业链与龙头总结", expanded=False):
+                        extra = st.text_input("可选：补充关键词/子行业/区域（提高针对性）", value="")
+                        gen_ind = st.button("生成行业总结", key=f"btn_ind_summary_{market}_{symbol}")
+                        if gen_ind:
+                            try:
+                                ctx_lines = [
+                                    f"市场: {market}",
+                                    f"代码: {symbol}",
+                                    f"名称: {stock_name or ''}",
+                                    f"所属行业: {ind_name}",
+                                ]
+                                if extra:
+                                    ctx_lines.append(f"补充: {extra}")
+                                sys_prompt = {"role":"system","content":"你是资深行业分析师。请围绕所给行业，概述上游-中游-下游的关键环节、各环节A/H常见龙头公司（如能给出）、驱动因素、景气度指标与风险点。中文分点输出，条理清晰，不构成投资建议。"}
+                                messages = [sys_prompt, {"role":"system","content":"上下文：\n" + "\n".join(ctx_lines)}]
+                                route_name = st.session_state.get("route_name", "default")
+                                enable_tools = st.session_state.get("enable_tools", True)
+                                registry = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
+                                router = LLMRouter(registry=registry, route_name=route_name)
+                                tools = get_tools_schema() if enable_tools else None
+                                res = chat_with_tools(router, messages, tools_schema=tools, max_rounds=2)
+                                txt = (res or {}).get("final_text") or ""
+                                if txt.strip():
+                                    st.markdown(txt)
+                                else:
+                                    _render_llm_answer(res)
+                            except Exception as e:
+                                st.warning(f"生成行业总结失败：{e}")
+                else:
+                    st.info("暂未识别到所属行业信息。")
+            except Exception as e:
+                st.warning(f"行业信息处理失败：{e}")
+
+        # 4) 未来三个月内可能存在的风险提示（调用大模型生成）
+        with tab_risk:
+            try:
+                # 构造上下文（价格走势、回测概况、行业信息、基础面摘要）
+                ctx_lines = [
+                    f"市场: {market}",
+                    f"代码: {symbol}",
+                    f"名称: {stock_name or ''}",
+                    f"周期: {period}",
+                ]
+                # 行业
+                try:
+                    if 'ind_name' in locals() and ind_name:
+                        ctx_lines.append(f"行业: {ind_name}")
+                except Exception:
+                    pass
+                # 简要走势统计（近60交易日）
+                try:
+                    last_n = df_disp.tail(60).copy()
+                    last_n["ret"] = last_n["close"].pct_change()
+                    ret_1m = (1 + last_n.tail(22)["ret"].fillna(0)).prod() - 1
+                    ret_3m = (1 + last_n["ret"].fillna(0)).prod() - 1
+                    vol_mean = float(last_n["volume"].tail(22).mean()) if "volume" in last_n.columns else 0
+                    ctx_lines.append(f"近1月涨跌幅: {ret_1m:.2%}")
+                    ctx_lines.append(f"近3月涨跌幅: {ret_3m:.2%}")
+                    ctx_lines.append(f"近1月平均成交量: {vol_mean:.0f}")
+                except Exception:
+                    pass
+
+                sys_prompt = {"role":"system","content":"你是资深卖方分析师和风控专家。请基于提供的上下文，在不臆测、不过度承诺的前提下，给出未来三个月内的主要风险点与监控要点，中文输出，列出 5-8 条要点，每条尽量具体且可操作。"}
+                messages = [sys_prompt, {"role":"system","content":"以下是上下文：\n" + "\n".join(ctx_lines)}]
+                # 允许用户补充提问或说明
+                user_tip = st.text_area("可选：补充你关注的风险点（将影响生成结果）", value="")
+                if user_tip:
+                    messages.append({"role":"user","content": user_tip})
+
+                route_name = st.session_state.get("route_name", "default")
+                enable_tools = st.session_state.get("enable_tools", True)
+                registry = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
+                router = LLMRouter(registry=registry, route_name=route_name)
+                tools = get_tools_schema() if enable_tools else None
+                res = chat_with_tools(router, messages, tools_schema=tools, max_rounds=2)
+                txt = (res or {}).get("final_text") or ""
+                if txt.strip():
+                    st.markdown(txt)
+                else:
+                    _render_llm_answer(res)
+
+                # 新增：(4) 可选风险-抓取文本并做进一步分析
+                with st.expander("可选：抓取相关新闻/公告文本并做进一步分析", expanded=False):
+                    st.caption("尝试多数据源获取最近若干条与该股相关的新闻/公告（因 akshare 版本差异，若接口不可用会自动跳过）")
+                    max_items = st.slider("抓取条数", 3, 20, 8)
+                    btn_fetch = st.button("抓取并生成分析", key=f"btn_risk_news_{market}_{symbol}")
+                    if btn_fetch:
+                        texts = []
+                        try:
+                            # 候选函数名与可能的参数结构（自动探测）
+                            candidates = [
+                                ("stock_news_em", {"symbol": symbol}),
+                                ("stock_company_announcement_em", {"symbol": symbol}),
+                                ("stock_notice", {"symbol": symbol}),
+                                ("stock_zh_a_notice", {"symbol": symbol}),
+                                ("stock_zh_a_news_em", {"symbol": symbol}),
+                                ("stock_hk_announcement_em", {"symbol": symbol}),
+                            ]
+                            for name, params in candidates:
+                                fn = getattr(ak, name, None)
+                                if fn is None:
+                                    continue
+                                try:
+                                    df_txt = fn(**params)  # type: ignore
+                                except TypeError:
+                                    # 有的函数使用不同参数名，尝试通配
+                                    try:
+                                        df_txt = fn(code=symbol)  # type: ignore
+                                    except Exception:
+                                        continue
+                                except Exception:
+                                    continue
+                                if df_txt is None or df_txt.empty:
+                                    continue
+                                # 提取常见文本列拼接
+                                cols_pref = [
+                                    "标题", "摘要", "内容", "公告标题", "公告内容", "新闻标题", "新闻内容", "文章标题", "简介", "题材"
+                                ]
+                                cols = [c for c in cols_pref if c in df_txt.columns]
+                                if not cols:
+                                    # 退化为选取第一列做标题
+                                    cols = [df_txt.columns[0]] if len(df_txt.columns) > 0 else []
+                                for _, r in df_txt.head(max_items).iterrows():
+                                    parts = []
+                                    for c in cols:
+                                        try:
+                                            val = str(r[c])
+                                            if val and val != "nan":
+                                                parts.append(val)
+                                        except Exception:
+                                            pass
+                                    if parts:
+                                        texts.append(" | ".join(parts))
+                                if len(texts) >= max_items:
+                                    break
+                        except Exception:
+                            pass
+                        if texts:
+                            st.success(f"已获取到 {len(texts)} 条文本。")
+                            st.write("\n\n".join([f"- {t}" for t in texts[:max_items]]))
+                            try:
+                                sys_prompt2 = {"role":"system","content":"你是资深研究员。请基于给定的新闻/公告要点，结合该股的基本面与走势上下文，给出对未来三个月风险与催化的分析（中文、分点、可操作、不过度自信）。"}
+                                messages2 = [sys_prompt2, {"role":"system","content":"基础上下文：\n" + "\n".join(ctx_lines)}, {"role":"user","content":"以下为抓取的文本要点：\n" + "\n".join(texts[:max_items])}]
+                                res2 = chat_with_tools(router, messages2, tools_schema=tools, max_rounds=2)
+                                txt2 = (res2 or {}).get("final_text") or ""
+                                if txt2.strip():
+                                    st.markdown(txt2)
+                                else:
+                                    _render_llm_answer(res2)
+                            except Exception as e:
+                                st.warning(f"基于文本的风险分析失败：{e}")
+                        else:
+                            st.info("未能抓取到可用文本（可能接口不可用或返回为空）。")
+            except Exception as e:
+                st.error(f"生成风险提示失败：{e}")
     else:
         st.info("无数据，请检查代码、周期或日期范围。港股周/月/季/年线为日线重采样。A股周/月线 AKShare 可能会在新股或特殊日期返回空。")
 
     # 大模型问答（通过配置 + 路由 或 直连）
     st.subheader("大模型问答")
+    # 展示当前模型（来源：合并后的路由 + 提供商配置）
+    try:
+        route_name = st.session_state.get("route_name", "default")
+        registry_preview = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
+        r = registry_preview.get_route(route_name)
+        p = registry_preview.get_provider(r.provider)
+        st.caption(f"当前模型：{p.name} · {r.model}（路由：{r.name}）")
+    except Exception as _e:
+        st.caption("当前模型：配置未就绪")
+
     inject_ctx = st.checkbox("将行情/回测摘要注入模型上下文", value=True)
     user_query = st.text_area("问模型：个股/行业信息、策略建议...", value="")
     if user_query:
@@ -437,7 +786,8 @@ def single_stock_page():
 
             # 读取路由/模型设置
             route_name = st.session_state.get("route_name", "default")
-            tools = get_tools_schema()
+            enable_tools = st.session_state.get("enable_tools", True)
+            tools = get_tools_schema() if enable_tools else None
             registry = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
             router = LLMRouter(registry=registry, route_name=route_name)
 
@@ -567,9 +917,10 @@ def industry_page():
             messages.append({"role":"user","content": user_query})
 
             route_name = st.session_state.get("route_name","default")
+            enable_tools = st.session_state.get("enable_tools", True)
             registry = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
             router = LLMRouter(registry=registry, route_name=route_name)
-            tools = get_tools_schema()
+            tools = get_tools_schema() if enable_tools else None
             result = chat_with_tools(router, messages, tools_schema=tools, max_rounds=3)
             final_text = result.get("final_text") or ""
             if final_text.strip():

@@ -3,10 +3,10 @@ import akshare as ak
 import pandas as pd
 
 
-def fetch_stock_info_a(args: Dict[str, Any]) -> Dict[str, Any]:
-    symbol = args.get("symbol")
+def fetch_stock_info_a(symbol: str) -> Dict[str, Any]:
+    symbol = (symbol or "").strip()
     if not symbol:
-        return {"error": "symbol is required"}
+        return {"ok": False, "error": "symbol is required"}
     try:
         df = ak.stock_individual_info_em(symbol=symbol)
         data = df.to_dict(orient="records")
@@ -15,15 +15,15 @@ def fetch_stock_info_a(args: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
-def fetch_stock_info_hk(args: Dict[str, Any]) -> Dict[str, Any]:
+def fetch_stock_info_hk(symbol: str) -> Dict[str, Any]:
     """
     港股个股实时/基础信息：
     - 现阶段优先返回实时报价行（包含名称、最新价、涨跌幅、成交额等）
     - 行业字段若来源不稳定，则暂不强制
     """
-    symbol = args.get("symbol")
+    symbol = (symbol or "").strip()
     if not symbol:
-        return {"error": "symbol is required"}
+        return {"ok": False, "error": "symbol is required"}
     try:
         df_spot = ak.stock_hk_spot_em()
         if df_spot is None or df_spot.empty:

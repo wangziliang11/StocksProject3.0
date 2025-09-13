@@ -41,6 +41,10 @@ def kline_with_volume(
     c = pd.to_numeric(df["close"], errors="coerce")
     v = pd.to_numeric(df["volume"], errors="coerce") if "volume" in df.columns else pd.Series([None]*len(df))
 
+    # 新增：计算涨跌幅（相对前一收盘）
+    prev_close = c.shift(1)
+    pct_chg = (c / prev_close - 1.0) * 100.0
+
     # 判断是否日线：仅日线才补充工作日缺失的 rangebreak，非日线只隐藏周末
     is_daily = (period == "daily")
 
@@ -60,20 +64,54 @@ def kline_with_volume(
         subplot_titles=subplot_titles,
     )
 
-    # K线
-    fig.add_trace(
-        go.Candlestick(
-            x=x,
-            open=o,
-            high=h,
-            low=l,
-            close=c,
-            name="K线",
-            increasing_line_color="#e74c3c",  # 红涨
-            decreasing_line_color="#2ecc71",  # 绿跌
-        ),
-        row=1, col=1
+    # K线（兼容旧版 Plotly：优先使用 hovertemplate，失败则回退到 hovertext）
+    hover_tpl = (
+        "K线： open: %{open:.2f}"
+        "<br>high: %{high:.2f}"
+        "<br>low: %{low:.2f}"
+        "<br>close: %{close:.2f}"
+        "<br>涨跌幅: %{customdata:.2f}%"
+        "<extra></extra>"
     )
+    try:
+        fig.add_trace(
+            go.Candlestick(
+                x=x,
+                open=o,
+                high=h,
+                low=l,
+                close=c,
+                name="K线",
+                increasing_line_color="#e74c3c",  # 红涨
+                decreasing_line_color="#2ecc71",  # 绿跌
+                customdata=pct_chg,
+                hovertemplate=hover_tpl,
+            ),
+            row=1, col=1
+        )
+    except Exception:
+        # 回退：构造逐点 hover 文本
+        hover_text = []
+        for oi, hi, lo, ci, pi in zip(o.fillna(0), h.fillna(0), l.fillna(0), c.fillna(0), pct_chg):
+            pct_str = "" if pd.isna(pi) else f"{pi:.2f}%"
+            hover_text.append(
+                f"K线： open: {oi:.2f}<br>high: {hi:.2f}<br>low: {lo:.2f}<br>close: {ci:.2f}<br>涨跌幅: {pct_str}"
+            )
+        fig.add_trace(
+            go.Candlestick(
+                x=x,
+                open=o,
+                high=h,
+                low=l,
+                close=c,
+                name="K线",
+                increasing_line_color="#e74c3c",
+                decreasing_line_color="#2ecc71",
+                hovertext=hover_text,
+                hoverinfo="text",
+            ),
+            row=1, col=1
+        )
 
     # MA 叠加
     if ma_windows:
