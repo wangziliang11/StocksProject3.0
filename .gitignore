@@ -14,3 +14,4 @@ __pycache__/
 /secrets/
 models.local.yaml
 routing.local.yaml
+/src/ui/data/

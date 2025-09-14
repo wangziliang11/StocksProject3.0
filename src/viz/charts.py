@@ -9,6 +9,12 @@ try:
 except Exception:
     macd_fn = None
 
+# 新增：尝试导入 RSI 计算
+try:
+    from src.logic.indicators import rsi as rsi_fn
+except Exception:
+    rsi_fn = None
+
 
 def _calc_macd(series: pd.Series):
     if macd_fn is not None:
@@ -20,6 +26,19 @@ def _calc_macd(series: pd.Series):
     hist = dif - dea
     return {"dif": dif, "dea": dea, "hist": hist}
 
+# 新增：RSI 计算（若外部不可用则本地实现简版）
+def _calc_rsi(series: pd.Series, period: int = 14):
+    if rsi_fn is not None:
+        return rsi_fn(series, period=period)
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.rolling(period, min_periods=1).mean()
+    roll_down = down.rolling(period, min_periods=1).mean().replace(0, 1e-9)
+    rs = roll_up / roll_down
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
 
 def kline_with_volume(
     df: pd.DataFrame,
@@ -27,6 +46,7 @@ def kline_with_volume(
     ma_windows: Optional[List[int]] = None,
     show_macd: bool = False,
     period: str = "daily",
+    second_rows: Optional[List[str]] = None,
 ) -> go.Figure:
     if df is None or df.empty:
         fig = go.Figure()
@@ -48,11 +68,23 @@ def kline_with_volume(
     # 判断是否日线：仅日线才补充工作日缺失的 rangebreak，非日线只隐藏周末
     is_daily = (period == "daily")
 
-    # 子图：价格、成交量、（可选）MACD
-    rows = 3 if show_macd else 2
-    row_heights = [0.62, 0.24, 0.14] if show_macd else [0.7, 0.3]
+    # 新增：根据 second_rows 决定价格下方的子图（最多两行），兼容旧的 show_macd 参数
+    allowed = ["成交量", "MACD", "RSI"]
+    if second_rows is None:
+        chosen = ["成交量"] + (["MACD"] if show_macd else [])
+    else:
+        chosen = [x for x in second_rows if x in allowed][:2]
+
+    # 子图：价格 + 选中的子图
+    rows = 1 + len(chosen)
+    if len(chosen) == 0:
+        row_heights = [1.0]
+    elif len(chosen) == 1:
+        row_heights = [0.74, 0.26]
+    else:
+        row_heights = [0.62, 0.24, 0.14]
     specs = [[{"type": "xy"}] for _ in range(rows)]
-    subplot_titles = [title, "成交量"] + (["MACD"] if show_macd else [])
+    subplot_titles = [title] + chosen
 
     fig = make_subplots(
         rows=rows,
@@ -123,26 +155,40 @@ def kline_with_volume(
                 row=1, col=1
             )
 
-    # 成交量：按涨跌上色
-    colors = ["\n" for _ in range(len(df))]
-    for i in range(len(df)):
-        colors[i] = "#e74c3c" if (c.iloc[i] >= o.iloc[i]) else "#2ecc71"
-    fig.add_trace(
-        go.Bar(x=x, y=v, name="成交量", marker_color=colors, opacity=0.8),
-        row=2, col=1
-    )
+    # 行索引映射：价格为 row=1，其余依次 2,3
+    row_idx = {name: (i + 2) for i, name in enumerate(chosen)}
 
-    # MACD 子图
-    if show_macd:
+    # 成交量：按涨跌上色（仅在选择时绘制）
+    if "成交量" in chosen:
+        colors = ["\n" for _ in range(len(df))]
+        for i in range(len(df)):
+            colors[i] = "#e74c3c" if (c.iloc[i] >= o.iloc[i]) else "#2ecc71"
+        fig.add_trace(
+            go.Bar(x=x, y=v, name="成交量", marker_color=colors, opacity=0.8),
+            row=row_idx["成交量"], col=1
+        )
+
+    # MACD 子图（仅在选择时绘制）
+    if "MACD" in chosen:
         macd_vals = _calc_macd(c)
         dif = macd_vals["dif"]
         dea = macd_vals["dea"]
         hist = macd_vals["hist"]
         # 柱状图：红正绿负
         bar_colors = ["#e74c3c" if val >= 0 else "#2ecc71" for val in hist]
-        fig.add_trace(go.Bar(x=x, y=hist, name="MACD Hist", marker_color=bar_colors, opacity=0.9), row=3, col=1)
-        fig.add_trace(go.Scatter(x=x, y=dif, name="DIF", line=dict(color="#ff9f43", width=1.2)), row=3, col=1)
-        fig.add_trace(go.Scatter(x=x, y=dea, name="DEA", line=dict(color="#0984e3", width=1.2)), row=3, col=1)
+        fig.add_trace(go.Bar(x=x, y=hist, name="MACD Hist", marker_color=bar_colors, opacity=0.9), row=row_idx["MACD"], col=1)
+        fig.add_trace(go.Scatter(x=x, y=dif, name="DIF", line=dict(color="#ff9f43", width=1.2)), row=row_idx["MACD"], col=1)
+        fig.add_trace(go.Scatter(x=x, y=dea, name="DEA", line=dict(color="#0984e3", width=1.2)), row=row_idx["MACD"], col=1)
+
+    # RSI 子图（仅在选择时绘制）
+    if "RSI" in chosen:
+        rsi_vals = _calc_rsi(c, period=14)
+        fig.add_trace(go.Scatter(x=x, y=rsi_vals, name="RSI", line=dict(color="#6c5ce7", width=1.2)), row=row_idx["RSI"], col=1)
+        # 参考线 30/70
+        lv30 = pd.Series(30, index=x)
+        lv70 = pd.Series(70, index=x)
+        fig.add_trace(go.Scatter(x=x, y=lv30, name="RSI-30", line=dict(color="#2ecc71", width=1, dash="dot"), showlegend=False), row=row_idx["RSI"], col=1)
+        fig.add_trace(go.Scatter(x=x, y=lv70, name="RSI-70", line=dict(color="#e74c3c", width=1, dash="dot"), showlegend=False), row=row_idx["RSI"], col=1)
 
     # 隐藏非交易日：周末 + （仅日线）缺失工作日
     rangebreaks = [dict(bounds=["sat", "mon"])]
@@ -170,9 +216,12 @@ def kline_with_volume(
 
     # 坐标轴标题与样式
     fig.update_yaxes(title_text="价格", row=1, col=1)
-    fig.update_yaxes(title_text="成交量", row=2, col=1, showgrid=False)
-    if show_macd:
-        fig.update_yaxes(title_text="MACD", row=3, col=1, showgrid=False)
+    if "成交量" in chosen:
+        fig.update_yaxes(title_text="成交量", row=row_idx["成交量"], col=1, showgrid=False)
+    if "MACD" in chosen:
+        fig.update_yaxes(title_text="MACD", row=row_idx["MACD"], col=1, showgrid=False)
+    if "RSI" in chosen:
+        fig.update_yaxes(title_text="RSI", row=row_idx["RSI"], col=1, showgrid=False, range=[0, 100])
 
     fig.update_layout(
         title=title,

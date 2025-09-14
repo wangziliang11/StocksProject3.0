@@ -47,3 +47,64 @@ def backtest_ma_cross(df: pd.DataFrame, short: int = 10, long: int = 20, fee: fl
     total = (strategy_ret != 0).sum()
     result["win_rate"] = float(wins / total) if total > 0 else 0.0
     return result
+
+# --- 新增：RSI 指标与相关回测 ---
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    roll_down = down.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    rs = roll_up / (roll_down.replace(0, 1e-12))
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val
+
+
+def backtest_macd_cross(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9, fee: float = 0.0005) -> Dict[str, float]:
+    result = {"trades": 0, "return": 0.0, "max_drawdown": 0.0, "win_rate": 0.0}
+    if df is None or df.empty or "close" not in df.columns:
+        return result
+    close = df["close"].astype(float)
+    m = macd(close, fast=fast, slow=slow, signal=signal)
+    dif, dea = m["dif"], m["dea"]
+    signal_line = (dif > dea).astype(int)
+    position = signal_line.shift(1).fillna(0)
+    ret = close.pct_change().fillna(0)
+    strategy_ret = position * ret - abs(position.diff().fillna(0)) * fee
+    equity = (1 + strategy_ret).cumprod()
+    result["return"] = equity.iloc[-1] - 1 if len(equity) else 0.0
+    result["max_drawdown"] = ((equity.cummax() - equity) / equity.cummax()).max() if len(equity) else 0.0
+    trades = (position.diff().abs() == 1).sum() // 2
+    result["trades"] = int(trades)
+    wins = (strategy_ret[strategy_ret != 0] > 0).sum()
+    total = (strategy_ret != 0).sum()
+    result["win_rate"] = float(wins / total) if total > 0 else 0.0
+    return result
+
+
+def backtest_rsi(df: pd.DataFrame, period: int = 14, low: int = 30, high: int = 70, fee: float = 0.0005) -> Dict[str, float]:
+    """简单 RSI 区间策略：RSI 上穿 low 买入，下穿 high 卖出。"""
+    result = {"trades": 0, "return": 0.0, "max_drawdown": 0.0, "win_rate": 0.0}
+    if df is None or df.empty or "close" not in df.columns:
+        return result
+    close = df["close"].astype(float)
+    r = rsi(close, period=period)
+    long_sig = (r > low).astype(int)  # 上穿低位后持有
+    flat_sig = (r < high).astype(int)
+    # 构造持仓：进入后持有，直到跌破 high（可按需改为上下穿交叉检测）
+    position = long_sig.copy()
+    position[r < low] = 0
+    position[r > high] = 0
+    position = position.shift(1).fillna(0)
+    ret = close.pct_change().fillna(0)
+    strategy_ret = position * ret - abs(position.diff().fillna(0)) * fee
+    equity = (1 + strategy_ret).cumprod()
+    result["return"] = equity.iloc[-1] - 1 if len(equity) else 0.0
+    result["max_drawdown"] = ((equity.cummax() - equity) / equity.cummax()).max() if len(equity) else 0.0
+    trades = (position.diff().abs() == 1).sum() // 2
+    result["trades"] = int(trades)
+    wins = (strategy_ret[strategy_ret != 0] > 0).sum()
+    total = (strategy_ret != 0).sum()
+    result["win_rate"] = float(wins / total) if total > 0 else 0.0
+    return result

@@ -26,6 +26,44 @@ class AKDataClient:
         return s
 
     @staticmethod
+    def _normalize_a_prefixed(symbol: str) -> str:
+        """
+        将输入的A股代码规范为带交易所前缀的小写格式，供 ak.stock_zh_a_daily 使用。
+        规则：
+        - 若已是 shXXXXXX / szXXXXXX（大小写不敏感），统一转小写返回
+        - 支持形如 600000、SH600000、sz000001、000001.SZ 等格式
+        - 前缀判定：以股票代码首位/前缀判断，'5','6','9','688','689' -> sh，否则 -> sz
+        """
+        s = str(symbol).upper().strip()
+        # 去除常见分隔符
+        s = s.replace(".", "").replace("-", "").replace(" ", "")
+        if s.startswith("SH") or s.startswith("SZ"):
+            pre = s[:2].lower()
+            code = s[2:]
+            # 只保留后6位数字（部分输入带市场代码或多余字符）
+            digits = "".join(ch for ch in code if ch.isdigit())
+            if len(digits) >= 6:
+                code = digits[-6:]
+            return f"{pre}{code}"
+        # 形如 000001SZ / 600000SH
+        if s.endswith("SH") or s.endswith("SZ"):
+            code_part = s[:-2]
+            exch = s[-2:].lower()
+            digits = "".join(ch for ch in code_part if ch.isdigit())
+            code = digits[-6:] if len(digits) >= 6 else digits.zfill(6)
+            return f"{exch}{code}"
+        # 纯数字或含数字优先提取后6位
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if len(digits) >= 6:
+            code = digits[-6:]
+        else:
+            code = digits.zfill(6)
+        # 简易交易所判断
+        if code.startswith(("5", "6", "9")) or code.startswith("688") or code.startswith("689"):
+            return f"sh{code}"
+        return f"sz{code}"
+
+    @staticmethod
     def _standardize(df: pd.DataFrame, market: str, symbol: str) -> pd.DataFrame:
         if df is None or df.empty:
             return pd.DataFrame(columns=[
@@ -42,7 +80,7 @@ class AKDataClient:
             "收盘": "close", "收盘价": "close", "close": "close",
             # 成交量/额
             "成交量": "volume", "成交量(股)": "volume", "成交量(手)": "volume", "volume": "volume", "vol": "volume",
-            "成交额": "amount", "成交额(港元)": "amount", "amount": "amount", "turnover": "amount",
+            "成交额": "amount", "成交额(元)": "amount", "成交额(港元)": "amount", "amount": "amount", "turnover": "amount",
             # 复权
             "复权因子": "adj_factor", "adj_factor": "adj_factor",
         }
@@ -151,6 +189,18 @@ class AKDataClient:
                 df_adj = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust=adjust)
             except Exception:
                 df_adj = pd.DataFrame()
+            # 回退：若加权数据为空，尝试带交易所前缀的另一接口
+            if df_adj is None or df_adj.empty:
+                pref = self._normalize_a_prefixed(symbol)
+                try:
+                    df_adj = ak.stock_zh_a_daily(symbol=pref, adjust=adjust)
+                except Exception:
+                    df_adj = pd.DataFrame()
+                if df_raw is None or df_raw.empty:
+                    try:
+                        df_raw = ak.stock_zh_a_daily(symbol=pref)
+                    except Exception:
+                        df_raw = pd.DataFrame()
             if df_adj is None or df_adj.empty:
                 return self._standardize(df_adj, market="A", symbol=symbol)
             # 标准化两份数据后按日期对齐，用收盘价比值得到复权因子
@@ -171,6 +221,13 @@ class AKDataClient:
                 df = ak.stock_zh_a_hist(symbol=symbol, period="daily")
             except Exception:
                 df = pd.DataFrame()
+            # 回退：若为空，尝试带前缀的 daily 接口
+            if df is None or df.empty:
+                pref = self._normalize_a_prefixed(symbol)
+                try:
+                    df = ak.stock_zh_a_daily(symbol=pref)
+                except Exception:
+                    df = pd.DataFrame()
             std = self._standardize(df, market="A", symbol=symbol)
             if not std.empty:
                 try:
@@ -210,6 +267,15 @@ class AKDataClient:
         if not need_refresh and market == "A" and adjust in ("qfq", "hfq"):
             try:
                 if ("adj_factor" not in cache.columns) or (cache["adj_factor"].isna().all()):
+                    need_refresh = True
+            except Exception:
+                need_refresh = True
+        # 若volume/amount列缺失或全为0/NA，强制刷新一次
+        if not need_refresh:
+            try:
+                vol_ok = ("volume" in cache.columns) and (pd.to_numeric(cache["volume"], errors="coerce").fillna(0).sum() > 0)
+                amt_ok = ("amount" in cache.columns) and (pd.to_numeric(cache["amount"], errors="coerce").fillna(0).sum() > 0)
+                if not (vol_ok and amt_ok):
                     need_refresh = True
             except Exception:
                 need_refresh = True

@@ -1,5 +1,8 @@
+﻿# -*- coding: utf-8 -*-
 # 股票分析系统入口（Streamlit）
 import streamlit as st
+# 移除不被当前版本支持的序列化配置项，避免 StreamlitAPIException
+# st.set_option("global.dataFrameSerialization", "legacy")
 import pandas as pd
 import akshare as ak
 import sys, os
@@ -8,11 +11,585 @@ from typing import Optional, List, Dict, Any
 import importlib
 import json
 from datetime import datetime, timedelta
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any as _Any
+from pandas.api.types import is_bool_dtype, is_object_dtype
 
+# Arrow 兼容工具：将布尔列转为字符串、对象列统一转字符串，避免 pyarrow 转换报错
+
+def ensure_arrow_compatible(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        if df is None or getattr(df, "empty", True):
+            return df
+        df2 = df.copy()
+        for col in df2.columns:
+            s = df2[col]
+            if is_bool_dtype(s):
+                df2[col] = s.map(lambda x: "是" if bool(x) else "否")
+            elif is_object_dtype(s):
+                df2[col] = s.astype(str)
+        return df2
+    except Exception:
+        return df
+
+# 项目根目录路径（供数据/模块导入）
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# 行业自选列表持久化
+INDUSTRY_WATCHLIST_PATH = ROOT / "data" / "industry_watchlist.json"
+# 自定义行业数据路径
+CUSTOM_INDUSTRIES_PATH = ROOT / "data" / "custom_industries.json"
+
+def _ensure_industry_data_dir():
+    (ROOT / "data").mkdir(parents=True, exist_ok=True)
+
+# 自定义行业读写
+def load_custom_industries() -> Dict[str, List[Dict[str, str]]]:
+    _ensure_industry_data_dir()
+    try:
+        if CUSTOM_INDUSTRIES_PATH.exists():
+            with open(CUSTOM_INDUSTRIES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                out: Dict[str, List[Dict[str, str]]] = {}
+                for k, v in data.items():
+                    if not isinstance(k, str) or not isinstance(v, list):
+                        continue
+                    items: List[Dict[str, str]] = []
+                    for it in v:
+                        if isinstance(it, dict) and "symbol" in it:
+                            market = str(it.get("market", "A")).strip() or "A"
+                            sym = str(it.get("symbol", "")).strip()
+                            nm = str(it.get("name", "")).strip()
+                            if sym:
+                                items.append({"market": market, "symbol": sym, "name": nm})
+                    out[k] = items
+                return out
+    except Exception:
+        pass
+    return {}
+
+def save_custom_industries(data: Dict[str, List[Dict[str, str]]]):
+    _ensure_industry_data_dir()
+    try:
+        with open(CUSTOM_INDUSTRIES_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+# 统一行业列表：官方 + 自定义
+def get_industry_list_all() -> List[str]:
+    base = ak_get_industry_list() or []
+    custom = load_custom_industries()
+    seen = set()
+    out: List[str] = []
+    for n in base:
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    for n in custom.keys():
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+# 统一成份股：优先自定义（仅当有效），否则回退官方
+def get_industry_cons(industry_name: str) -> pd.DataFrame:
+    custom = load_custom_industries()
+    if industry_name in custom:
+        items = custom[industry_name]
+        # 仅当自定义有有效 symbol 才使用，否则回退官方
+        if items:
+            df = pd.DataFrame(items)
+            if "symbol" in df.columns and df["symbol"].notna().any():
+                if "name" not in df.columns:
+                    df["name"] = ""
+                df["symbol"] = df["symbol"].astype(str).str.strip()
+                # 规范化为6位数字，兼容 000001.SZ / sz000001 / 空格等
+                try:
+                    sym6 = df["symbol"].str.extract(r"(\d{6})", expand=False)
+                    df["symbol"] = sym6.fillna(df["symbol"]).astype(str).str.strip()
+                except Exception:
+                    pass
+                df["name"] = df["name"].astype(str).str.strip()
+                return df[["symbol", "name"]].copy()
+    # 回退官方/概念成份
+    return ak_get_industry_cons(industry_name)
+
+def load_industry_watchlist() -> List[str]:
+    _ensure_industry_data_dir()
+    try:
+        if INDUSTRY_WATCHLIST_PATH.exists():
+            with open(INDUSTRY_WATCHLIST_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                # 去重并保持顺序
+                seen = set()
+                out = []
+                for x in data:
+                    if isinstance(x, str) and x not in seen:
+                        seen.add(x)
+                        out.append(x)
+                return out
+    except Exception:
+        pass
+    return []
+
+def save_industry_watchlist(items: List[str]):
+    _ensure_industry_data_dir()
+    try:
+        with open(INDUSTRY_WATCHLIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(items[:50], f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+@st.cache_data(ttl=3600)
+def ak_get_industry_list() -> List[str]:
+    import akshare as ak
+    names: List[str] = []
+    try:
+        # 常见接口1：东方财富 行业列表（不同版本列名可能不同）
+        df = None
+        for fn in [getattr(ak, n) for n in [
+            "stock_board_industry_name_url",
+            "stock_board_industry_name_em",
+            # 有些环境仅支持其中一个
+        ] if hasattr(ak, n)]:
+            try:
+                df = fn()
+                if df is not None and not df.empty:
+                    break
+            except Exception:
+                continue
+        if df is not None and not df.empty:
+            # 取可能的名称列
+            for col in ["行业名称", "板块名称", "板块简称", "名称", "name"]:
+                if col in df.columns:
+                    names = [str(x).strip() for x in df[col].dropna().tolist()]
+                    break
+            if not names:
+                # 若未知列名，则取首列
+                first_col = df.columns[0]
+                names = [str(x).strip() for x in df[first_col].dropna().tolist()]
+        # 回退：东方财富 概念列表（如“电池”等常见概念）
+        if not names:
+            df2 = None
+            for fn2 in [getattr(ak, n) for n in [
+                "stock_board_concept_name_em",
+                "stock_board_concept_name_url",
+            ] if hasattr(ak, n)]:
+                try:
+                    df2 = fn2()
+                    if df2 is not None and not df2.empty:
+                        break
+                except Exception:
+                    continue
+            if df2 is not None and not df2.empty:
+                for col in ["概念名称", "板块名称", "板块简称", "名称", "name"]:
+                    if col in df2.columns:
+                        names = [str(x).strip() for x in df2[col].dropna().tolist()]
+                        break
+                if not names:
+                    first_col2 = df2.columns[0]
+                    names = [str(x).strip() for x in df2[first_col2].dropna().tolist()]
+    except Exception:
+        names = []
+
+    # 若依然为空，回退到本地自定义行业；仍为空则提供少量内置常见行业/概念，避免下拉为空
+    if not names:
+        try:
+            local_names = list(load_custom_industries().keys())
+        except Exception:
+            local_names = []
+        if local_names:
+            names = local_names
+        else:
+            names = [
+                "电池", "半导体", "光伏设备", "储能", "风电设备",
+                "人工智能", "机器人", "券商", "白酒", "煤炭", "有色金属",
+            ]
+
+    # 去重
+    seen = set()
+    out: List[str] = []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+@st.cache_data(ttl=1800)
+def ak_get_industry_cons(industry_name: str) -> pd.DataFrame:
+    import akshare as ak
+    df = pd.DataFrame()
+    # 先尝试：东方财富 行业成份
+    try:
+        if hasattr(ak, "stock_board_industry_cons_em"):
+            fn = getattr(ak, "stock_board_industry_cons_em")
+            try:
+                df = fn(symbol=industry_name)
+            except TypeError:
+                try:
+                    df = fn(industry=industry_name)
+                except Exception:
+                    try:
+                        df = fn(industry_name)
+                    except Exception:
+                        df = pd.DataFrame()
+    except Exception:
+        df = pd.DataFrame()
+
+    # 若行业为空，进一步尝试：东方财富 概念成份（兼容“电池”等概念板块）
+    if df is None or df.empty:
+        candidates = [industry_name]
+        if not str(industry_name).endswith("概念"):
+            candidates.append(f"{industry_name}概念")
+        for nm in candidates:
+            got = pd.DataFrame()
+            try:
+                if hasattr(ak, "stock_board_concept_cons_em"):
+                    fn2 = getattr(ak, "stock_board_concept_cons_em")
+                    try:
+                        got = fn2(symbol=nm)
+                    except TypeError:
+                        try:
+                            got = fn2(concept=nm)
+                        except Exception:
+                            try:
+                                got = fn2(nm)
+                            except Exception:
+                                got = pd.DataFrame()
+                # 进一步兜底尝试同花顺概念（部分环境可用）
+                if (got is None or got.empty) and hasattr(ak, "stock_board_concept_cons_ths"):
+                    fn3 = getattr(ak, "stock_board_concept_cons_ths")
+                    try:
+                        got = fn3(symbol=nm)
+                    except TypeError:
+                        try:
+                            got = fn3(concept=nm)
+                        except Exception:
+                            try:
+                                got = fn3(nm)
+                            except Exception:
+                                got = pd.DataFrame()
+            except Exception:
+                got = pd.DataFrame()
+            if got is not None and not got.empty:
+                df = got
+                break
+
+    if df is None:
+        df = pd.DataFrame()
+    # 标准化代码/名称列
+    code_col = None
+    name_col = None
+    for c in ["代码", "股票代码", "证券代码", "code"]:
+        if c in df.columns:
+            code_col = c
+            break
+    for c in ["名称", "股票名称", "证券简称", "name"]:
+        if c in df.columns:
+            name_col = c
+            break
+    if code_col is None:
+        df["代码"] = []
+        code_col = "代码"
+    if name_col is None:
+        df["名称"] = []
+        name_col = "名称"
+    out = df[[code_col, name_col]].rename(columns={code_col: "symbol", name_col: "name"}).copy()
+    # 代码统一为字符串
+    out["symbol"] = out["symbol"].astype(str).str.strip()
+    # 若包含交易所后缀或其他字符，优先提取6位数字作为A股代码
+    try:
+        sym6 = out["symbol"].str.extract(r"(\d{6})", expand=False)
+        out["symbol"] = sym6.fillna(out["symbol"]).astype(str).str.strip()
+    except Exception:
+        pass
+    return out
+
+@st.cache_data(ttl=1200)
+def compute_symbol_volume_metrics(market: str, symbol: str, N: int) -> Dict[str, Any]:
+    client = get_client()
+    df = client.get_hist(market=market, symbol=symbol, period="daily")
+    # 若字段缺失或全为0/NA，尝试强制刷新一次
+    if df is None or df.empty or "volume" not in df.columns or pd.to_numeric(df.get("volume", pd.Series([])), errors="coerce").fillna(0).sum() == 0:
+        df2 = client.get_hist(market=market, symbol=symbol, period="daily", refresh=True, expire_days=0)
+        if df2 is not None and not df2.empty:
+            df = df2
+    if df is None or df.empty or "volume" not in df.columns:
+        return {"curr": 0.0, "yoy": None, "mom": None, "prev": None, "yoy_pct": None, "mom_pct": None}
+    x = df.sort_values("date").copy()
+    x["volume"] = pd.to_numeric(x["volume"], errors="coerce").fillna(0)
+    if len(x) < N + 2:
+        N = max(1, min(N, len(x)))
+    curr = float(x["volume"].tail(N).sum())
+    # 环比：前一N日
+    prev = float(x["volume"].tail(N*2).head(N).sum()) if len(x) >= N*2 else None
+    # 同比：去年同期N日（按交易日回溯约 252 天）
+    try:
+        last_date = x["date"].iloc[-1]
+        one_year_ago = last_date - pd.Timedelta(days=365)
+        ywin = x[(x["date"] <= one_year_ago)].tail(N)
+        yoy = float(ywin["volume"].sum()) if not ywin.empty else None
+    except Exception:
+        yoy = None
+    yoy_pct = (curr - yoy) / yoy if (yoy and yoy > 0) else None
+    mom_pct = (curr - prev) / prev if (prev and prev > 0) else None
+    return {"curr": curr, "yoy": yoy, "prev": prev, "yoy_pct": yoy_pct, "mom_pct": mom_pct}
+
+@st.cache_data(ttl=1200)
+def compute_industry_volume_metrics(industry_name: str, N: int) -> Dict[str, Any]:
+    cons = get_industry_cons(industry_name)
+    if cons is None or cons.empty:
+        return {"curr": 0.0, "yoy": None, "mom": None, "prev": None, "yoy_pct": None, "mom_pct": None, "leaders": []}
+    curr_sum = 0.0
+    prev_sum = 0.0
+    yoy_sum = 0.0
+    prev_has = False
+    yoy_has = False
+    leaders: List[Dict[str, Any]] = []
+    for _, row in cons.iterrows():
+        sym = str(row.get("symbol", "")).strip()
+        name = str(row.get("name", "")).strip()
+        if not sym:
+            continue
+        m = compute_symbol_volume_metrics("A", sym, N)
+        curr_sum += m.get("curr") or 0.0
+        if m.get("prev") is not None:
+            prev_sum += m["prev"] or 0.0
+            prev_has = True
+        if m.get("yoy") is not None:
+            yoy_sum += m["yoy"] or 0.0
+            yoy_has = True
+        leaders.append({"symbol": sym, "name": name, "curr": m.get("curr", 0.0)})
+    # 选龙头：按近N日成交量排序取前5
+    leaders = sorted(leaders, key=lambda x: x.get("curr", 0.0), reverse=True)[:5]
+    yoy_val = yoy_sum if yoy_has else None
+    prev_val = prev_sum if prev_has else None
+    yoy_pct = (curr_sum - yoy_val) / yoy_val if (yoy_val and yoy_val > 0) else None
+    mom_pct = (curr_sum - prev_val) / prev_val if (prev_val and prev_val > 0) else None
+    return {"curr": curr_sum, "yoy": yoy_val, "prev": prev_val, "yoy_pct": yoy_pct, "mom_pct": mom_pct, "leaders": leaders, "count": int(len(cons))}
+
+@st.cache_data(ttl=1200)
+def _compute_symbol_window_metrics(market: str, symbol: str, N: int, field: str) -> Dict[str, Any]:
+    client = get_client()
+    df = client.get_hist(market=market, symbol=symbol, period="daily")
+    # 若字段缺失或全为0/NA，尝试强制刷新一次
+    if df is None or df.empty or field not in df.columns or pd.to_numeric(df.get(field, pd.Series([])), errors="coerce").fillna(0).sum() == 0:
+        df2 = client.get_hist(market=market, symbol=symbol, period="daily", refresh=True, expire_days=0)
+        if df2 is not None and not df2.empty:
+            df = df2
+    if df is None or df.empty or field not in df.columns:
+        return {"curr": 0.0, "yoy": None, "mom": None, "prev": None, "yoy_pct": None, "mom_pct": None}
+    x = df.sort_values("date").copy()
+    x[field] = pd.to_numeric(x[field], errors="coerce").fillna(0)
+    if len(x) < N + 2:
+        N = max(1, min(N, len(x)))
+    curr = float(x[field].tail(N).sum())
+    prev = float(x[field].tail(N*2).head(N).sum()) if len(x) >= N*2 else None
+    try:
+        last_date = x["date"].iloc[-1]
+        one_year_ago = last_date - pd.Timedelta(days=365)
+        ywin = x[(x["date"] <= one_year_ago)].tail(N)
+        yoy = float(ywin[field].sum()) if not ywin.empty else None
+    except Exception:
+        yoy = None
+    yoy_pct = (curr - yoy) / yoy if (yoy and yoy > 0) else None
+    mom_pct = (curr - prev) / prev if (prev and prev > 0) else None
+    return {"curr": curr, "yoy": yoy, "prev": prev, "yoy_pct": yoy_pct, "mom_pct": mom_pct}
+
+# ---- 基于“时间周期”的统计 ----
+@st.cache_data(ttl=1200)
+def _compute_symbol_period_metrics(market: str, symbol: str, start_date: _Any, end_date: _Any, field: str = "volume") -> Dict[str, Any]:
+    client = get_client()
+    df = client.get_hist(market=market, symbol=symbol, period="daily")
+    # 若字段缺失或全为0/NA，尝试强制刷新一次
+    if df is None or df.empty or field not in df.columns or pd.to_numeric(df.get(field, pd.Series([])), errors="coerce").fillna(0).sum() == 0:
+        df2 = client.get_hist(market=market, symbol=symbol, period="daily", refresh=True, expire_days=0)
+        if df2 is not None and not df2.empty:
+            df = df2
+    if df is None or df.empty or field not in df.columns:
+        return {"curr": 0.0, "yoy": None, "mom": None, "prev": None, "yoy_pct": None, "mom_pct": None}
+    x = df.sort_values("date").copy()
+    x[field] = pd.to_numeric(x[field], errors="coerce").fillna(0)
+    try:
+        s = pd.to_datetime(start_date)
+        e = pd.to_datetime(end_date)
+    except Exception:
+        return {"curr": 0.0, "yoy": None, "mom": None, "prev": None, "yoy_pct": None, "mom_pct": None}
+    if pd.isna(s) or pd.isna(e):
+        return {"curr": 0.0, "yoy": None, "mom": None, "prev": None, "yoy_pct": None, "mom_pct": None}
+    if s > e:
+        s, e = e, s
+    cur_win = x[(x["date"] >= s) & (x["date"] <= e)]
+    if cur_win is None or cur_win.empty:
+        return {"curr": 0.0, "yoy": None, "mom": None, "prev": None, "yoy_pct": None, "mom_pct": None}
+    L = len(cur_win)
+    curr = float(cur_win[field].sum())
+    # 环比：紧挨着上一个同长度交易日窗口
+    prev_win = x[x["date"] < s].tail(L)
+    prev = float(prev_win[field].sum()) if not prev_win.empty else None
+    # 同比：去年同一日期区间
+    try:
+        s_py = s - pd.Timedelta(days=365)
+        e_py = e - pd.Timedelta(days=365)
+        yoy_win = x[(x["date"] >= s_py) & (x["date"] <= e_py)]
+        yoy = float(yoy_win[field].sum()) if not yoy_win.empty else None
+    except Exception:
+        yoy = None
+    yoy_pct = (curr - yoy) / yoy if (yoy and yoy > 0) else None
+    mom_pct = (curr - prev) / prev if (prev and prev > 0) else None
+    return {"curr": curr, "yoy": yoy, "prev": prev, "yoy_pct": yoy_pct, "mom_pct": mom_pct}
+
+@st.cache_data(ttl=1200)
+def compute_symbol_volume_metrics_period(market: str, symbol: str, start_date: _Any, end_date: _Any) -> Dict[str, Any]:
+    return _compute_symbol_period_metrics(market, symbol, start_date, end_date, "volume")
+
+@st.cache_data(ttl=1200)
+def compute_symbol_amount_metrics_period(market: str, symbol: str, start_date: _Any, end_date: _Any) -> Dict[str, Any]:
+    return _compute_symbol_period_metrics(market, symbol, start_date, end_date, "amount")
+
+@st.cache_data(ttl=1200)
+def compute_industry_volume_metrics_period(industry_name: str, start_date: _Any, end_date: _Any) -> Dict[str, Any]:
+    cons = get_industry_cons(industry_name)
+    if cons is None or cons.empty:
+        return {"curr": 0.0, "yoy": None, "mom": None, "prev": None, "yoy_pct": None, "mom_pct": None, "leaders": []}
+    curr_sum = 0.0
+    prev_sum = 0.0
+    yoy_sum = 0.0
+    prev_has = False
+    yoy_has = False
+    leaders: List[Dict[str, Any]] = []
+    for _, row in cons.iterrows():
+        sym = str(row.get("symbol", "")).strip()
+        name = str(row.get("name", "")).strip()
+        if not sym:
+            continue
+        m = compute_symbol_volume_metrics_period("A", sym, start_date, end_date)
+        curr_sum += m.get("curr") or 0.0
+        if m.get("prev") is not None:
+            prev_sum += m["prev"] or 0.0
+            prev_has = True
+        if m.get("yoy") is not None:
+            yoy_sum += m["yoy"] or 0.0
+            yoy_has = True
+        leaders.append({"symbol": sym, "name": name, "curr": m.get("curr", 0.0)})
+    leaders = sorted(leaders, key=lambda x: x.get("curr", 0.0), reverse=True)[:5]
+    yoy_val = yoy_sum if yoy_has else None
+    prev_val = prev_sum if prev_has else None
+    yoy_pct = (curr_sum - yoy_val) / yoy_val if (yoy_val and yoy_val > 0) else None
+    mom_pct = (curr_sum - prev_val) / prev_val if (prev_val and prev_val > 0) else None
+    return {"curr": curr_sum, "yoy": yoy_val, "prev": prev_val, "yoy_pct": yoy_pct, "mom_pct": mom_pct, "leaders": leaders, "count": int(len(cons))}
+
+@st.cache_data(ttl=1200)
+def compute_industry_amount_metrics_period(industry_name: str, start_date: _Any, end_date: _Any) -> Dict[str, Any]:
+    cons = get_industry_cons(industry_name)
+    if cons is None or cons.empty:
+        return {"curr": 0.0, "yoy": None, "mom": None, "prev": None, "yoy_pct": None, "mom_pct": None}
+    curr_sum = 0.0
+    prev_sum = 0.0
+    yoy_sum = 0.0
+    prev_has = False
+    yoy_has = False
+    for _, row in cons.iterrows():
+        sym = str(row.get("symbol", "")).strip()
+        if not sym:
+            continue
+        m = compute_symbol_amount_metrics_period("A", sym, start_date, end_date)
+        curr_sum += m.get("curr") or 0.0
+        if m.get("prev") is not None:
+            prev_sum += m["prev"] or 0.0
+            prev_has = True
+        if m.get("yoy") is not None:
+            yoy_sum += m["yoy"] or 0.0
+            yoy_has = True
+    yoy_val = yoy_sum if yoy_has else None
+    prev_val = prev_sum if prev_has else None
+    yoy_pct = (curr_sum - yoy_val) / yoy_val if (yoy_val and yoy_val > 0) else None
+    mom_pct = (curr_sum - prev_val) / prev_val if (prev_val and prev_val > 0) else None
+    return {"curr": curr_sum, "yoy": yoy_val, "prev": prev_val, "yoy_pct": yoy_pct, "mom_pct": mom_pct}
+
+@st.cache_data(ttl=1200)
+def compute_symbol_amount_metrics(market: str, symbol: str, N: int) -> Dict[str, Any]:
+    return _compute_symbol_window_metrics(market, symbol, N, "amount")
+
+@st.cache_data(ttl=1200)
+def compute_industry_amount_metrics(industry_name: str, N: int) -> Dict[str, Any]:
+    cons = get_industry_cons(industry_name)
+    if cons is None or cons.empty:
+        return {"curr": 0.0, "yoy": None, "mom": None, "prev": None, "yoy_pct": None, "mom_pct": None}
+    curr_sum = 0.0
+    prev_sum = 0.0
+    yoy_sum = 0.0
+    prev_has = False
+    yoy_has = False
+    for _, row in cons.iterrows():
+        sym = str(row.get("symbol", "")).strip()
+        if not sym:
+            continue
+        m = compute_symbol_amount_metrics("A", sym, N)
+        curr_sum += m.get("curr") or 0.0
+        if m.get("prev") is not None:
+            prev_sum += m["prev"] or 0.0
+            prev_has = True
+        if m.get("yoy") is not None:
+            yoy_sum += m["yoy"] or 0.0
+            yoy_has = True
+    yoy_val = yoy_sum if yoy_has else None
+    prev_val = prev_sum if prev_has else None
+    yoy_pct = (curr_sum - yoy_val) / yoy_val if (yoy_val and yoy_val > 0) else None
+    mom_pct = (curr_sum - prev_val) / prev_val if (prev_val and prev_val > 0) else None
+    return {"curr": curr_sum, "yoy": yoy_val, "prev": prev_val, "yoy_pct": yoy_pct, "mom_pct": mom_pct}
+
+@st.cache_data(ttl=1200)
+def compute_industry_agg_series(industry_name: str, column: str, days: int = 60, start_date: _Any = None, end_date: _Any = None) -> pd.DataFrame:
+    cons = get_industry_cons(industry_name)
+    if cons is None or cons.empty:
+        return pd.DataFrame(columns=["date", column])
+    agg = None
+    client = get_client()
+    s_dt = pd.to_datetime(start_date) if start_date is not None else None
+    e_dt = pd.to_datetime(end_date) if end_date is not None else None
+    for _, row in cons.iterrows():
+        sym = str(row.get("symbol", "")).strip()
+        if not sym:
+            continue
+        df = client.get_hist(market="A", symbol=sym, period="daily")
+        # 若字段缺失或全为0/NA，尝试强制刷新一次
+        if df is None or df.empty or column not in df.columns or pd.to_numeric(df.get(column, pd.Series([])), errors="coerce").fillna(0).sum() == 0:
+            df2 = client.get_hist(market="A", symbol=sym, period="daily", refresh=True, expire_days=0)
+            if df2 is not None and not df2.empty:
+                df = df2
+        if df is None or df.empty or column not in df.columns:
+            continue
+        x = df[["date", column]].copy().dropna()
+        x["date"] = pd.to_datetime(x["date"], errors="coerce")
+        x[column] = pd.to_numeric(x[column], errors="coerce").fillna(0)
+        if s_dt is not None and e_dt is not None:
+            x = x[(x["date"] >= s_dt) & (x["date"] <= e_dt)]
+        else:
+            x = x.sort_values("date").tail(max(days*2, days))
+        x = x.set_index("date").rename(columns={column: sym})
+        agg = x if agg is None else agg.join(x, how="outer")
+    if agg is None or agg.empty:
+        return pd.DataFrame(columns=["date", column])
+    s = agg.fillna(0).sum(axis=1).reset_index()
+    s.columns = ["date", column]
+    s = s.sort_values("date")
+    if s_dt is None or e_dt is None:
+        s = s.tail(days)
+    return s
+
 from src.data.ak_client import AKDataClient
+
+@st.cache_resource
+def get_client() -> AKDataClient:
+    return AKDataClient()
+
 from src.logic.indicators import sma, ema, macd, backtest_ma_cross
 from src.viz.charts import kline_with_volume
 from src.llm.providers.registry import ProviderRegistry, LLMRouter, OpenAICompatClient
@@ -60,7 +637,7 @@ def _render_llm_answer(result: Dict[str, _Any]):
 
 def chat_with_tools(router: LLMRouter, messages, tools_schema=None, max_rounds: int = 3):
     """
-    通用自动工具执行循环：
+    通用自动工具执行循环
     - 使用提供的 router（OpenAI 兼容接口）发送消息
     - 当模型返回 tool_calls 时，在本地调用 TOOL_MAP 对应函数
     - 将工具结果作为 tool 消息回传，再次让模型整合，直到产出最终答案或达到轮数上限
@@ -79,7 +656,7 @@ def chat_with_tools(router: LLMRouter, messages, tools_schema=None, max_rounds: 
                 msg = choices[0].get("message") or {}
             else:
                 msg = rsp.get("message") or {}
-        # 无法解析，直接返回原始
+        # 无法解析，直接返回原始结果
         if not isinstance(msg, dict):
             return {"final_text": "", "raw": rsp}
 
@@ -119,14 +696,14 @@ def chat_with_tools(router: LLMRouter, messages, tools_schema=None, max_rounds: 
             # 继续下一轮，让模型整合工具结果
             continue
         else:
-            # 没有工具调用，认为已给出最终回答
+            # 没有工具调用，认为已给出最终回复
             return {"final_text": content, "raw": rsp}
 
     # 达到回合上限，返回最后一次原始结果
     return {"final_text": content if content else "", "raw": last_raw}
 
 
-# 缓存获取股票名称（A股/港股）
+# 缓存获取股票名称（A/港股）
 @st.cache_data(ttl=3600)
 def get_stock_name_cached(market: str, symbol: str) -> Optional[str]:
     try:
@@ -178,6 +755,307 @@ def get_stock_name_cached(market: str, symbol: str) -> Optional[str]:
         return None
     return None
 
+@st.cache_data(ttl=3600)
+def get_a_stock_list_cached() -> pd.DataFrame:
+    """
+    优先从 akshare 获取 A 股代码/名称；若接口异常或返回空，则回退到本地缓存目录 data/cache/A 中已存在的标的目录作为兜底。
+    """
+    try:
+        df = pd.DataFrame()
+        # 1) 优先尝试多个 akshare 接口（不同版本字段/函数名不一致）
+        for fn_name, kwargs in [
+            ("stock_zh_a_spot_em", {}),
+            ("stock_info_a_code_name", {}),
+            ("stock_zh_a_spot", {}),
+            ("stock_zh_a_spot_deal", {}),
+        ]:
+            try:
+                fn = getattr(ak, fn_name, None)
+                if fn is None:
+                    continue
+                tmp = fn(**kwargs)
+                if tmp is not None and not tmp.empty:
+                    df = tmp
+                    break
+            except Exception:
+                continue
+        # 2) 若仍为空，尝试从本地缓存兜底
+        if df is None or df.empty:
+            try:
+                a_dir = ROOT / "data" / "cache" / "A"
+                codes: list[str] = []
+                if a_dir.exists():
+                    for p in a_dir.iterdir():
+                        if p.is_dir():
+                            s = "".join(ch for ch in p.name if ch.isdigit())
+                            if len(s) >= 6:
+                                codes.append(s[-6:])
+                codes = sorted(set(codes))
+                if codes:
+                    out = pd.DataFrame({"代码": [c for c in codes], "名称": [""] * len(codes)})
+                    return ensure_arrow_compatible(out)
+            except Exception:
+                pass
+            return pd.DataFrame(columns=["代码","名称"])  
+        # 3) 规范列名并标准化代码
+        code_col = None
+        name_col = None
+        for c in ["代码", "symbol", "code", "证券代码", "股票代码"]:
+            if c in df.columns:
+                code_col = c
+                break
+        for c in ["名称", "name", "证券名称", "股票简称", "简称"]:
+            if c in df.columns:
+                name_col = c
+                break
+        if code_col is None:
+            return pd.DataFrame(columns=["代码","名称"])  
+        out = pd.DataFrame()
+        out["代码"] = (
+            df[code_col]
+            .astype(str)
+            .str.upper()
+            .str.replace(".SH", "", regex=False)
+            .str.replace(".SZ", "", regex=False)
+            .str.replace("SH", "", regex=False)
+            .str.replace("SZ", "", regex=False)
+            .str.replace(".", "", regex=False)
+            .str.zfill(6)
+        )
+        out["名称"] = df[name_col].astype(str) if name_col else ""
+        return ensure_arrow_compatible(out)
+    except Exception:
+        # 兜底：硬返回空结构，避免 UI 崩溃
+        return pd.DataFrame(columns=["代码","名称"])  
+
+@st.cache_data(ttl=3600)
+def get_hk_ggt_list_cached() -> pd.DataFrame:
+    """
+    优先从 akshare 获取港股通成分；若失败则回退到本地缓存目录 data/cache/H 中已有的标的目录。
+    修复：部分环境中 ak 接口默认只返回单个方向，需分别拉取“港股通（沪）/（深）”，并统一标准化为 5 位代码。
+    """
+    try:
+        # 1) akshare 官方港股通列表：分别尝试“港股通（沪）/（深）”，兼容半角括号
+        df_list: list[pd.DataFrame] = []
+        dbg: list[Dict[str, Any]] = []
+        for fn_name, kwargs in [
+            ("stock_hk_ggt_components_em", {"symbol": "港股通（沪）"}),
+            ("stock_hk_ggt_components_em", {"symbol": "港股通（深）"}),
+            ("stock_hk_ggt_components_em", {"symbol": "港股通(沪)"}),
+            ("stock_hk_ggt_components_em", {"symbol": "港股通(深)"}),
+            # 兼容旧版：无参调用可能直接返回全部或默认一个方向
+            ("stock_hk_ggt_components_em", {}),
+        ]:
+            try:
+                fn = getattr(ak, fn_name, None)
+                if fn is None:
+                    continue
+                tmp = fn(**kwargs)
+                if tmp is not None and not tmp.empty:
+                    df_list.append(tmp)
+                    try:
+                        dbg.append({"source": f"{fn_name}({kwargs})", "len": int(len(tmp)), "columns": list(tmp.columns)})
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        dbg.append({"source": f"{fn_name}({kwargs})", "len": 0, "columns": list(tmp.columns) if tmp is not None else []})
+                    except Exception:
+                        pass
+            except Exception as e:
+                try:
+                    dbg.append({"source": f"{fn_name}({kwargs})", "error": str(e)})
+                except Exception:
+                    pass
+                continue
+        df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+
+        # 2) 若仍为空，回退到本地缓存目录，但不早退：继续尝试“全量行情”兜底合并
+        if df is None or df.empty:
+            out = pd.DataFrame(columns=["代码","名称"])  # 初始为空
+            try:
+                h_dir = ROOT / "data" / "cache" / "H"
+                codes: list[str] = []
+                if h_dir.exists():
+                    for p in h_dir.iterdir():
+                        if p.is_dir():
+                            s = "".join(ch for ch in p.name if ch.isdigit())
+                            if s:
+                                if len(s) >= 5:
+                                    s = s[-5:]
+                                codes.append(s.zfill(5))
+                codes = sorted(set(codes))
+                if codes:
+                    out = pd.DataFrame({"代码": codes, "名称": [""] * len(codes)})
+            except Exception:
+                pass
+            # 记录调试信息（即使只有本地缓存）
+            try:
+                st.session_state["_dbg_hk_ggt_sources"] = (dbg or []) + [{"source": "local_cache_H", "len": int(len(out))}]
+                st.session_state["_dbg_hk_ggt_final"] = {"len": int(len(out)), "columns": list(out.columns)}
+            except Exception:
+                pass
+            # 若仍偏少，继续尝试用“港股全量行情”列表合并兜底
+            try:
+                if len(out) < 50:
+                    for spot_name in [
+                        "stock_hk_main_board_spot_em",
+                        "stock_hk_spot_em",
+                        "stock_hk_spot",
+                    ]:
+                        fn_spot = getattr(ak, spot_name, None)
+                        if fn_spot is None:
+                            continue
+                        try:
+                            hk = fn_spot()
+                            if hk is None or hk.empty:
+                                continue
+                            code_col2 = next((c for c in ["代码","symbol","code","证券代码"] if c in hk.columns), None)
+                            name_col2 = next((c for c in ["名称","name","证券名称","股票简称","简称"] if c in hk.columns), None)
+                            if code_col2 is None:
+                                continue
+                            tmp = pd.DataFrame()
+                            tmp["代码"] = (
+                                hk[code_col2]
+                                .astype(str)
+                                .str.upper()
+                                .str.replace(".HK", "", regex=False)
+                                .str.extract(r"(\d+)")[0]
+                                .fillna("")
+                                .apply(lambda s: s[-5:].zfill(5) if s else "")
+                            )
+                            tmp["名称"] = hk[name_col2].astype(str) if name_col2 else ""
+                            tmp = tmp[tmp["代码"] != ""].drop_duplicates(subset=["代码"])
+                            if not tmp.empty:
+                                codes_merged = sorted(set(list(out["代码"])) | set(list(tmp["代码"]))) if not out.empty else sorted(set(list(tmp["代码"])))
+                                out = pd.DataFrame({"代码": codes_merged, "名称": [""] * len(codes_merged)})
+                                try:
+                                    dbg.append({"source": f"fallback: {spot_name}", "len": int(len(tmp)), "columns": list(hk.columns)})
+                                    st.session_state["_dbg_hk_ggt_sources"] = dbg
+                                    st.session_state["_dbg_hk_ggt_final"] = {"len": int(len(out)), "columns": list(out.columns), "fallback_spot": spot_name}
+                                except Exception:
+                                    pass
+                                break
+                        except Exception as e:
+                            try:
+                                dbg.append({"source": f"{spot_name}()", "error": str(e)})
+                                st.session_state["_dbg_hk_ggt_sources"] = dbg
+                            except Exception:
+                                pass
+                            continue
+            except Exception:
+                pass
+            return ensure_arrow_compatible(out)
+
+        # 3) 规范列名并标准化代码
+        code_col = None
+        name_col = None
+        for c in ["代码", "symbol", "code", "证券代码", "股票代码"]:
+            if c in df.columns:
+                code_col = c
+                break
+        for c in ["名称", "name", "证券名称", "股票简称", "简称"]:
+            if c in df.columns:
+                name_col = c
+                break
+        if code_col is None:
+            return pd.DataFrame(columns=["代码","名称"])  
+
+        out = pd.DataFrame()
+        # 提取数字并标准化为 5 位港股代码
+        codes_series = df[code_col].astype(str).str.extract(r"(\d+)")[0].fillna("")
+        out["代码"] = codes_series.apply(lambda s: s[-5:].zfill(5) if s else "")
+        out["名称"] = df[name_col].astype(str) if name_col else ""
+
+        # 去重与排序
+        out = out[out["代码"] != ""].drop_duplicates(subset=["代码"]).sort_values("代码").reset_index(drop=True)
+
+        # 记录调试信息
+        try:
+            st.session_state["_dbg_hk_ggt_sources"] = dbg
+            st.session_state["_dbg_hk_ggt_final"] = {"len": int(len(out)), "columns": list(out.columns), "head": out.head(10).to_dict(orient="records")}
+        except Exception:
+            pass
+
+        # 若数量异常偏少，尝试与本地缓存目录合并兜底
+        try:
+            if len(out) < 50:
+                h_dir = ROOT / "data" / "cache" / "H"
+                codes_local: list[str] = []
+                if h_dir.exists():
+                    for p in h_dir.iterdir():
+                        if p.is_dir():
+                            s = "".join(ch for ch in p.name if ch.isdigit())
+                            if s:
+                                if len(s) >= 5:
+                                    s = s[-5:]
+                                codes_local.append(s.zfill(5))
+                if codes_local:
+                    codes_merged = sorted(set(list(out["代码"]) + codes_local))
+                    out = pd.DataFrame({"代码": codes_merged, "名称": [""] * len(codes_merged)})
+                    try:
+                        st.session_state["_dbg_hk_ggt_final"] = {"len": int(len(out)), "columns": list(out.columns), "merged_local": True}
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 4) 数量仍偏少：临时大兜底——合并港股全量行情列表
+        try:
+            if len(out) < 50:
+                for spot_name in [
+                    "stock_hk_main_board_spot_em",
+                    "stock_hk_spot_em",
+                    "stock_hk_spot",
+                ]:
+                    fn_spot = getattr(ak, spot_name, None)
+                    if fn_spot is None:
+                        continue
+                    try:
+                        hk = fn_spot()
+                        if hk is None or hk.empty:
+                            continue
+                        code_col2 = next((c for c in ["代码","symbol","code","证券代码"] if c in hk.columns), None)
+                        name_col2 = next((c for c in ["名称","name","证券名称","股票简称","简称"] if c in hk.columns), None)
+                        if code_col2 is None:
+                            continue
+                        tmp = pd.DataFrame()
+                        tmp["代码"] = (
+                            hk[code_col2]
+                            .astype(str)
+                            .str.upper()
+                            .str.replace(".HK", "", regex=False)
+                            .str.extract(r"(\d+)")[0]
+                            .fillna("")
+                            .apply(lambda s: s[-5:].zfill(5) if s else "")
+                        )
+                        tmp["名称"] = hk[name_col2].astype(str) if name_col2 else ""
+                        tmp = tmp[tmp["代码"] != ""].drop_duplicates(subset=["代码"])
+                        if not tmp.empty:
+                            codes_merged = sorted(set(list(out["代码"])) | set(list(tmp["代码"])) ) if not out.empty else sorted(set(list(tmp["代码"])) )
+                            out = pd.DataFrame({"代码": codes_merged, "名称": [""] * len(codes_merged)})
+                            try:
+                                dbg.append({"source": f"fallback: {spot_name}", "len": int(len(tmp)), "columns": list(hk.columns)})
+                                st.session_state["_dbg_hk_ggt_sources"] = dbg
+                                st.session_state["_dbg_hk_ggt_final"] = {"len": int(len(out)), "columns": list(out.columns), "fallback_spot": spot_name}
+                            except Exception:
+                                pass
+                            break
+                    except Exception as e:
+                        try:
+                            dbg.append({"source": f"{spot_name}()", "error": str(e)})
+                        except Exception:
+                            pass
+                        continue
+        except Exception:
+            pass
+
+        return ensure_arrow_compatible(out)
+    except Exception:
+        return pd.DataFrame(columns=["代码","名称"])  
+    except Exception:
+        return pd.DataFrame(columns=["代码","名称"])  
+
 # -------- 新增：导航与自选股持久化工具 --------
 WATCHLIST_PATH = ROOT / "data" / "watchlist.json"
 
@@ -206,10 +1084,10 @@ def go_detail(market: str, symbol: str):
     except Exception:
         st.warning("无法跳转到详情页，请确认已创建 pages/StockDetail.py")
 
-# -------- 详情页所复用的单股页面（原 main）提取为函数 --------
+# -------- 详情页所复用的单股页面（从 main）提取为函数 --------
 def single_stock_page():
     st.header("单只股票查询")
-    # 原 sidebar 中的控件迁移为当前分区内控件
+    # 将 sidebar 中的控件迁移为当前分区内控件
     c1, c2, c3 = st.columns([1.2, 1, 1])
     with c1:
         market = st.selectbox("市场", ["A", "H"], index=st.session_state.get("_ss_market_idx", 0), key="ss_market")
@@ -217,7 +1095,7 @@ def single_stock_page():
         symbol = st.text_input("股票代码", value=st.session_state.get("detail_symbol", "600519" if market == "A" else "00700"))
     with c2:
         period = st.selectbox("周期", ["daily", "weekly", "monthly", "quarterly", "yearly"], index=0, key="ss_period")
-        start = st.text_input("开始(YYYYMMDD)", value="20180101")
+        start = st.text_input("开始日期(YYYYMMDD)", value="20180101")
         end = st.text_input("结束(YYYYMMDD)", value="20251231")
     with c3:
         adjust = st.selectbox("复权(A)", [None, "qfq", "hfq"], index=0, key="ss_adjust") if market == "A" else None
@@ -225,13 +1103,27 @@ def single_stock_page():
         refresh = st.checkbox("强制刷新", value=False)
         expire_days = st.number_input("过期天数", 0, 365, 3, 1)
 
-    show_ma = st.checkbox("显示 MA 均线", value=True)
-    ma_list_str = st.text_input("MA窗口(逗号分隔)", value="5,10,20,60")
-    ma_windows = [int(x) for x in ma_list_str.split(',') if x.strip().isdigit()] if show_ma else []
-    show_macd = st.checkbox("显示 MACD", value=False)
+    # 数据获取前：指标显示控制（放到 K 线图旁边的布局中使用）
+    # 先临时保存配置，稍后绘图区域再布局到 K 线图旁边
+    show_ma_default = st.session_state.get("_show_ma", True)
+    ma_list_default = st.session_state.get("_ma_list_str", "5,10,20,60")
+    show_macd_default = st.session_state.get("_show_macd", False)
+    second_rows_default = st.session_state.get("_second_rows", ["成交量"])  # 次级子图最多两行
+
+    # 懒加载：仅在点击“开始查询”或勾选“自动查询”时才获取数据
+    col_ctrl1, col_ctrl2 = st.columns([1,1])
+    with col_ctrl1:
+        btn_query = st.button("开始查询", key="_single_do_query")
+    with col_ctrl2:
+        auto_query = st.checkbox("自动查询", value=False, key="_single_auto_query", help="默认不在首次渲染时发起网络请求")
+    _do_query = (str(symbol or "").strip() != "") and (btn_query or auto_query)
+
+    if not _do_query:
+        st.info("为提升首屏速度，默认不自动查询。请设置参数后点击“开始查询”或勾选“自动查询”。")
+        return
 
     # 数据获取
-    client = AKDataClient()
+    client = get_client()
     df = client.get_hist(market=market, symbol=symbol, period=period, start=start, end=end, adjust=adjust, use_cache=use_cache, refresh=refresh, expire_days=expire_days)
 
     # 股票名称（缓存）
@@ -284,60 +1176,158 @@ def single_stock_page():
         "symbol": "代码",
     }
 
-    st.subheader(f"历史数据概览 - {stock_name}({symbol})" if stock_name else f"历史数据概览 - {symbol}")
-    # 详情页跳转按钮
-    if st.button("跳转到详情页", key="go_detail_single"):
-        go_detail(market, symbol)
-    if df_disp is not None and not df_disp.empty:
-        st.dataframe(df_disp.sort_values("date", ascending=False).rename(columns=cn_map).head(200))
-    else:
-        st.info("无数据，请检查代码、周期或日期范围。")
+    # 已按需求：隐藏历史详情数据模块，改为弹窗方式展示
+    @st.dialog("历史详情数据")
+    def _show_history_dialog():
+        if df_disp is not None and not df_disp.empty:
+            st.dataframe(
+                ensure_arrow_compatible(
+                    df_disp.sort_values("date", ascending=False).rename(columns=cn_map).head(500)
+                )
+            )
+        else:
+            st.info("无数据，请检查代码、周期或日期范围。")
 
-    # 个股/行业信息（A股/港股）
-    st.subheader("个股/行业信息")
-    if market == "A":
-        show_info = st.checkbox("拉取个股基本信息(A股)", value=False)
-        if show_info:
-            try:
-                info_df = ak.stock_individual_info_em(symbol=symbol)
-                st.dataframe(info_df)
-            except Exception as e:
-                st.warning(f"获取个股信息失败: {e}")
-    else:
-        show_info_hk = st.checkbox("拉取个股实时报价(港股)", value=False)
-        if show_info_hk:
-            try:
-                df_spot = ak.stock_hk_spot_em()
-                code_col = None
-                for c in ["代码", "symbol", "code", "证券代码"]:
-                    if c in df_spot.columns:
-                        code_col = c
-                        break
-                if code_col is None:
-                    st.warning("数据格式异常：未找到代码列")
-                else:
-                    sym = str(symbol).upper().replace(".HK", "")
-                    df_spot["_code_norm"] = df_spot[code_col].astype(str).str.upper().str.replace(".HK", "", regex=False).str.lstrip("0")
-                    sym_norm = sym.lstrip("0")
-                    candidates = df_spot[df_spot["_code_norm"] == sym_norm].drop(columns=["_code_norm"])
-                    if candidates.empty:
-                        st.info("未在实时报价列表中找到该代码，可能为停牌或代码格式不匹配。请尝试包含或去除前导 0。")
-                    else:
-                        st.dataframe(candidates)
-            except Exception as e:
-                st.warning(f"获取港股实时报价失败: {e}")
+    # 隐藏历史数据概览直接展示，改用弹窗触发
+    cols_hist = st.columns([1, 1, 6])
+    with cols_hist[0]:
+        if st.button("跳转到详情页", key="go_detail_single"):
+            go_detail(market, symbol)
+    with cols_hist[1]:
+        if st.button("查看历史详情数据", key="btn_show_hist_dialog_top"):
+            _show_history_dialog()
 
-    # 指标与回测
+    # 先绘制 K 线图，并把“查看历史详情数据”按钮放在旁边（顶部已有同名按钮，保留两个入口）
+    st.subheader("K线图")
+    fig_title = f"{stock_name}({symbol}) K线" if stock_name else f"{symbol} K线"
+
+    # 左右并列：左侧图，右侧控制
+    lc, rc = st.columns([5, 2])
+    with rc:
+        show_ma = st.checkbox("显示 MA 均线", value=show_ma_default, key="_show_ma")
+        ma_list_str = st.text_input("MA窗口(逗号分隔)", value=ma_list_default, key="_ma_list_str")
+        ma_windows = [int(x) for x in ma_list_str.split(',') if x.strip().isdigit()] if show_ma else []
+        # 次级子图选择（最多两行）
+        second_opts = ["成交量", "MACD", "RSI"]
+        second_rows = st.multiselect("次级子图（最多选2项）", options=second_opts, default=second_rows_default, max_selections=2, key="_second_rows")
+        show_macd = ("MACD" in second_rows)
+    with lc:
+        try:
+            import src.viz.charts as charts_mod
+            charts_mod = importlib.reload(charts_mod)
+            fig = charts_mod.kline_with_volume(df_disp, title=fig_title, ma_windows=ma_windows, show_macd=show_macd, period=period, second_rows=second_rows)
+        except Exception:
+            fig = kline_with_volume(df_disp, title=fig_title, ma_windows=ma_windows, show_macd=show_macd, period=period, second_rows=second_rows)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 新增：成交量统计（近N日、去年同比、环比）
+    with st.container():
+        st.subheader("成交量统计")
+        cols_n = st.columns([1.2,1.2,1.6,1.6,1.6,1.6])
+        with cols_n[0]:
+            mode = st.selectbox("统计模式", options=["近N日", "时间周期"], index=0, key="_single_stat_mode")
+            N = st.number_input("N(日)", min_value=5, max_value=250, value=20, step=5, key="_vol_N_single") if mode == "近N日" else None
+        with cols_n[1]:
+            if mode == "时间周期":
+                default_end = pd.to_datetime("today").normalize()
+                default_start = default_end - pd.Timedelta(days=30)
+                s = st.date_input("开始", value=default_start.date(), key="_single_period_start")
+                e = st.date_input("结束", value=default_end.date(), key="_single_period_end")
+            else:
+                s = e = None
+        # 计算并展示
+        try:
+            if mode == "近N日":
+                metrics = compute_symbol_volume_metrics(market, symbol, int(N))
+            else:
+                metrics = compute_symbol_volume_metrics_period(market, symbol, s, e)
+            curr = metrics.get("curr") or 0.0
+            yoy = metrics.get("yoy")
+            prev = metrics.get("prev")
+            yoy_pct = metrics.get("yoy_pct")
+            mom_pct = metrics.get("mom_pct")
+            with cols_n[2]:
+                title_v_curr = "近N日成交量(股)" if mode == "近N日" else "周期内成交量(股)"
+                st.metric(title_v_curr, f"{curr:,.0f}")
+            with cols_n[3]:
+                title_v_y = "去年同期N日(股)" if mode == "近N日" else "去年同期(股)"
+                st.metric(title_v_y, "-" if yoy is None else f"{yoy:,.0f}", delta=None)
+            with cols_n[4]:
+                st.metric("同比", "-" if yoy_pct is None else f"{yoy_pct:.2%}")
+            with cols_n[5]:
+                st.metric("环比", "-" if mom_pct is None else f"{mom_pct:.2%}")
+        except Exception as e:
+            st.info(f"成交量统计暂不可用：{e}")
+
+    # 移到 K 线图下方的“指标与回测”
     st.subheader("指标与回测")
     if df_disp is not None and not df_disp.empty:
         close = df_disp["close"].astype(float)
         df_ind = df_disp.copy()
+        # 策略选择
+        st.write("")
+        col_sel1, col_sel2, col_sel3 = st.columns([1.2, 1, 1])
+        with col_sel1:
+            strat = st.selectbox("策略", ["MA 金叉", "MACD 金叉", "RSI 区间"], index=0, key="_bt_strat")
+        with col_sel2:
+            ma_params = st.text_input("MA参数(短,长)", value="20,60", key="_bt_ma_params")
+        with col_sel3:
+            rsi_params = st.text_input("RSI参数(周期,低位,高位)", value="14,30,70", key="_bt_rsi_params")
+
+        # 解析参数
+        short, long = 20, 60
+        try:
+            parts = [int(x) for x in ma_params.split(',') if x.strip().isdigit()]
+            if len(parts) >= 2:
+                short, long = parts[0], parts[1]
+        except Exception:
+            pass
+        rsi_period, rsi_low, rsi_high = 14, 30, 70
+        try:
+            ps = [int(x) for x in rsi_params.split(',') if x.strip().isdigit()]
+            if len(ps) >= 3:
+                rsi_period, rsi_low, rsi_high = ps[0], ps[1], ps[2]
+        except Exception:
+            pass
+
+        # 计算指标以便复用（不强制显示）
         df_ind["SMA20"] = sma(close, 20)
         df_ind["SMA60"] = sma(close, 60)
-        res_bt = backtest_ma_cross(df_ind, short=20, long=60)
-        st.write("回测结果：", res_bt)
 
-        # 新增：一键生成中文总结
+        # 回测执行
+        if strat == "MA 金叉":
+            from src.logic.indicators import backtest_ma_cross
+            res_bt = backtest_ma_cross(df_ind, short=short, long=long)
+            strat_name = f"MA({short}/{long}) 趋势策略"
+        elif strat == "MACD 金叉":
+            from src.logic.indicators import backtest_macd_cross
+            res_bt = backtest_macd_cross(df_ind)
+            strat_name = "MACD 金叉/死叉"
+        else:
+            from src.logic.indicators import backtest_rsi
+            res_bt = backtest_rsi(df_ind, period=rsi_period, low=rsi_low, high=rsi_high)
+            strat_name = f"RSI 区间({rsi_period},{rsi_low},{rsi_high})"
+
+        # 展示回测信息（策略、周期、区间与核心指标）
+        trades = int((res_bt or {}).get("trades", 0))
+        ret = float((res_bt or {}).get("return", 0.0))
+        mdd = float((res_bt or {}).get("max_drawdown", 0.0))
+        win = float((res_bt or {}).get("win_rate", 0.0))
+        period_txt = {"daily":"日线","weekly":"周线","monthly":"月线","quarterly":"季线","yearly":"年线"}.get(period, str(period))
+        try:
+            start_date = pd.to_datetime(df_disp["date"].min()).date() if "date" in df_disp.columns else None
+            end_date = pd.to_datetime(df_disp["date"].max()).date() if "date" in df_disp.columns else None
+        except Exception:
+            start_date, end_date = None, None
+        st.caption(f"策略：{strat_name} | 周期：{period_txt}" + (f" | 区间：{start_date} ~ {end_date}" if start_date and end_date else ""))
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: st.metric("交易笔数", f"{trades}")
+        with c2: st.metric("累计收益", f"{ret:.2%}")
+        with c3: st.metric("最大回撤", f"{mdd:.2%}")
+        with c4: st.metric("胜率", f"{win:.2%}")
+        if trades == 0:
+            st.info("无交易产生，可能因为区间内无信号或区间过短。")
+
         col_a, col_b = st.columns([1, 4])
         with col_a:
             gen_cn = st.button("生成中文总结", use_container_width=True)
@@ -348,42 +1338,30 @@ def single_stock_page():
                 mdd = float(res_bt.get("max_drawdown", 0.0))
                 win = float(res_bt.get("win_rate", 0.0))
                 period_txt = {"daily":"日线","weekly":"周线","monthly":"月线","quarterly":"季线","yearly":"年线"}.get(period, str(period))
-                ma_txt = "MA(20/60) 趋势策略：当短均线上穿长均线买入、下穿卖出；适合趋势行情，震荡时容易虚假信号。"
+                ma_txt = "MA(20/60) 趋势策略：当短均线上穿长均线买入、下穿卖出；适合趋势行情，震荡时容易出现虚假信号。"
                 summary = (
                     f"回测基于{period_txt}与所选展示区间。共 {trades} 笔交易，区间累计收益约 {ret:.2%}，最大回撤约 {mdd:.2%}，胜率约 {win:.2%}。\n"
                     f"直观解读：收益较{'可观' if ret>0 else '一般'}，回撤{'偏高' if mdd>0.25 else '可控'}，胜率{'略低于' if win<0.5 else '高于'} 50%。策略更依赖趋势段与盈亏比，需控制仓位与止损。\n"
                     f"策略说明：{ma_txt}\n"
-                    f"风控建议：可叠加成交量/RSI/布林带过滤、设置固定或ATR止损、使用多周期共振（周线定方向，{period_txt}择时）。以上仅为方法参考，非投资建议。"
+                    f"风控建议：可叠加成交量/RSI/布林带过滤、设置固定或 ATR 止损、使用多周期共振（周线定方向，{period_txt}择时）。以上仅为方法参考，非投资建议。"
                 )
                 st.success("中文总结已生成：")
                 st.write(summary)
             except Exception as e:
                 st.warning(f"生成中文总结失败：{e}")
 
-        # 绘图
-        st.subheader("K线图")
-        fig_title = f"{stock_name}({symbol}) K线" if stock_name else f"{symbol} K线"
-        # 确保使用 charts 最新定义，避免旧模块签名导致的报错
-        try:
-            import src.viz.charts as charts_mod
-            charts_mod = importlib.reload(charts_mod)
-            fig = charts_mod.kline_with_volume(df_disp, title=fig_title, ma_windows=ma_windows, show_macd=show_macd, period=period)
-        except Exception:
-            # 回退：直接使用已导入的函数
-            fig = kline_with_volume(df_disp, title=fig_title, ma_windows=ma_windows, show_macd=show_macd, period=period)
-        st.plotly_chart(fig, use_container_width=True)
-
-        # === 新增：个股详情四项信息 ===
-        st.subheader("个股详情")
-        tab_base, tab_fin, tab_ind, tab_risk = st.tabs(["基本面信息", "最新财报信息", "所属行业信息", "未来三个月风险提示"])
+    # 删除原先的“个股/行业信息（A/港股）”模块
+    # === 新增：个股详情四项信息 ===
+    st.subheader("个股详情")
+    tab_base, tab_fin, tab_ind, tab_risk = st.tabs(["基本面信息", "最新财报信息", "所属行业信息", "未来三个月风险提示"])
 
         # 1) 基本面信息
-        with tab_base:
+    with tab_base:
             try:
                 if market == "A":
                     base_df = ak.stock_individual_info_em(symbol=symbol)
                     if base_df is not None and not base_df.empty:
-                        st.dataframe(base_df)
+                        st.dataframe(ensure_arrow_compatible(base_df))
                     else:
                         st.info("未获取到 A 股基本面信息。")
                 else:
@@ -400,7 +1378,7 @@ def single_stock_page():
                             hk_spot["_code_norm"] = hk_spot[code_col].astype(str).str.upper().str.replace(".HK", "", regex=False).str.lstrip("0")
                             row = hk_spot[hk_spot["_code_norm"] == sym.lstrip("0")].drop(columns=["_code_norm"])  # type: ignore
                             if not row.empty:
-                                st.dataframe(row)
+                                st.dataframe(ensure_arrow_compatible(row))
                             else:
                                 st.info("未在港股实时报价中找到该代码。")
                         else:
@@ -411,7 +1389,7 @@ def single_stock_page():
                 st.warning(f"获取基本面信息失败：{e}")
 
         # 2) 最新财报信息
-        with tab_fin:
+    with tab_fin:
             ok = False
             fin_df_used = None
             if market == "A":
@@ -434,14 +1412,14 @@ def single_stock_page():
                                 col = next((c for c in cand_cols if c in fin_df.columns), None)
                                 if col:
                                     _tmp = fin_df.copy()
-                                    _tmp["__dt__"] = pd.to_datetime(_tmp[col].astype(str).str.replace("年", "-").str.replace("月", "-").str.replace("日", ""), errors="coerce")
+                                    _tmp["__dt__"] = pd.to_datetime(_tmp[col].astype(str).str.replace("年", "-", regex=False).str.replace("月", "-", regex=False).str.replace("日", "", regex=False), errors="coerce")
                                     _tmp = _tmp.sort_values("__dt__", ascending=False, na_position="last").drop(columns=["__dt__"])
                                     fin_df_used = _tmp
                                 else:
                                     fin_df_used = fin_df
                             except Exception:
                                 fin_df_used = fin_df
-                            st.dataframe(fin_df_used)
+                            st.dataframe(ensure_arrow_compatible(fin_df_used))
                             ok = True
                             break
                     except Exception:
@@ -470,14 +1448,14 @@ def single_stock_page():
                                 col = next((c for c in cand_cols if c in fin_df.columns), None)
                                 if col:
                                     _tmp = fin_df.copy()
-                                    _tmp["__dt__"] = pd.to_datetime(_tmp[col].astype(str).str.replace("年", "-").str.replace("月", "-").str.replace("日", ""), errors="coerce")
+                                    _tmp["__dt__"] = pd.to_datetime(_tmp[col].astype(str).str.replace("年", "-", regex=False).str.replace("月", "-", regex=False).str.replace("日", "", regex=False), errors="coerce")
                                     _tmp = _tmp.sort_values("__dt__", ascending=False, na_position="last").drop(columns=["__dt__"])
                                     fin_df_used = _tmp
                                 else:
                                     fin_df_used = fin_df
                             except Exception:
                                 fin_df_used = fin_df
-                            st.dataframe(fin_df_used)
+                            st.dataframe(ensure_arrow_compatible(fin_df_used))
                             ok = True
                             break
                     except Exception:
@@ -488,18 +1466,18 @@ def single_stock_page():
                     else:
                         st.info("当前 akshare 版本暂未提供港股财报适配接口。")
 
-            # 新增：(3) 在数据表格后追加财报文字总结（由大模型生成）
+            # 新增（3） 在数据表格后追加财报文字总结（由大模型生成）
             if ok and fin_df_used is not None and not fin_df_used.empty:
                 with st.expander("生成财报文字总结", expanded=False):
                     topn = st.slider("纳入总结的最近期数量", min_value=1, max_value=min(8, len(fin_df_used)), value=min(4, len(fin_df_used)))
                     df_for_sum = fin_df_used.head(topn)
-                    st.dataframe(df_for_sum)
+                    st.dataframe(ensure_arrow_compatible(df_for_sum))
                     gen_fin_sum = st.button("生成总结", key=f"btn_fin_sum_{market}_{symbol}")
                     if gen_fin_sum:
                         try:
                             # 将表格压缩为 JSON 文本供模型理解
                             jtxt = df_for_sum.to_json(orient="records", force_ascii=False)
-                            sys_prompt = {"role":"system","content":"你是资深卖方分析师。请基于最近几个财报期的关键指标，给出中文要点总结：收入/利润同比、毛利/净利率趋势、费用趋势、现金流与资产负债变化、分红与指引（如有）、核心风险与看点。避免夸大，不构成投资建议。"}
+                            sys_prompt = {"role":"system","content":"你是资深卖方分析师。请基于最近几个财报期的关键指标，给出中文要点总结：收入与利润同比、毛利率与净利率趋势、费用趋势、现金流与资产负债变化、分红与指引（如有）、核心风险与看点。避免夸大，不构成投资建议。"}
                             messages = [sys_prompt, {"role":"system","content":f"股票: {stock_name or ''}({symbol}) | 市场: {market}"}, {"role":"user","content":"以下是最近期财报数据（JSON）：\n" + jtxt}]
                             route_name = st.session_state.get("route_name", "default")
                             enable_tools = st.session_state.get("enable_tools", True)
@@ -516,7 +1494,7 @@ def single_stock_page():
                             st.warning(f"生成财报总结失败：{e}")
 
         # 3) 所属行业信息
-        with tab_ind:
+    with tab_ind:
             try:
                 ind_name = None
                 if market == "A":
@@ -544,7 +1522,7 @@ def single_stock_page():
                             sym = str(symbol).upper().replace(".HK", "")
                             hk_spot["_code_norm"] = hk_spot[code_col].astype(str).str.upper().str.replace(".HK", "", regex=False).str.lstrip("0")
                             row = hk_spot[hk_spot["_code_norm"] == sym.lstrip("0")]
-                            # 在行情表里尝试常见行业列名
+                            # 在行情表里尝试常见行业列
                             for candi in ["行业", "所属行业", "板块", "行业分类"]:
                                 if candi in row.columns and not row.empty:
                                     val = str(row.iloc[0][candi])
@@ -555,9 +1533,9 @@ def single_stock_page():
                         pass
                 if ind_name:
                     st.success(f"所属行业：{ind_name}")
-                    # 新增：(2) 调用大模型生成行业上中下游与龙头总结
+                    # 新增（2） 调用大模型生成行业上中下游与龙头总结
                     with st.expander("生成行业产业链与龙头总结", expanded=False):
-                        extra = st.text_input("可选：补充关键词/子行业/区域（提高针对性）", value="")
+                        extra = st.text_input("可选：补充关键子行业/区域（提高针对性）", value="")
                         gen_ind = st.button("生成行业总结", key=f"btn_ind_summary_{market}_{symbol}")
                         if gen_ind:
                             try:
@@ -590,7 +1568,7 @@ def single_stock_page():
                 st.warning(f"行业信息处理失败：{e}")
 
         # 4) 未来三个月内可能存在的风险提示（调用大模型生成）
-        with tab_risk:
+    with tab_risk:
             try:
                 # 构造上下文（价格走势、回测概况、行业信息、基础面摘要）
                 ctx_lines = [
@@ -637,9 +1615,9 @@ def single_stock_page():
                 else:
                     _render_llm_answer(res)
 
-                # 新增：(4) 可选风险-抓取文本并做进一步分析
+                # 新增（4） 可选风险：抓取文本并做进一步分析
                 with st.expander("可选：抓取相关新闻/公告文本并做进一步分析", expanded=False):
-                    st.caption("尝试多数据源获取最近若干条与该股相关的新闻/公告（因 akshare 版本差异，若接口不可用会自动跳过）")
+                    st.caption("尝试多数据源获取最近若干条与该股相关的新闻/公告（因 akshare 版本差异，若接口不可用会自动跳过）。")
                     max_items = st.slider("抓取条数", 3, 20, 8)
                     btn_fetch = st.button("抓取并生成分析", key=f"btn_risk_news_{market}_{symbol}")
                     if btn_fetch:
@@ -670,7 +1648,7 @@ def single_stock_page():
                                     continue
                                 if df_txt is None or df_txt.empty:
                                     continue
-                                # 提取常见文本列拼接
+                                # 提取常见文本列拼
                                 cols_pref = [
                                     "标题", "摘要", "内容", "公告标题", "公告内容", "新闻标题", "新闻内容", "文章标题", "简介", "题材"
                                 ]
@@ -708,13 +1686,11 @@ def single_stock_page():
                             except Exception as e:
                                 st.warning(f"基于文本的风险分析失败：{e}")
                         else:
-                            st.info("未能抓取到可用文本（可能接口不可用或返回为空）。")
+                            st.info("未能抓取到可用文本（可能接口不可用或返回为空）")
             except Exception as e:
                 st.error(f"生成风险提示失败：{e}")
-    else:
-        st.info("无数据，请检查代码、周期或日期范围。港股周/月/季/年线为日线重采样。A股周/月线 AKShare 可能会在新股或特殊日期返回空。")
 
-    # 大模型问答（通过配置 + 路由 或 直连）
+    # 大模型问答（通过配置 + 路由/直连）
     st.subheader("大模型问答")
     # 展示当前模型（来源：合并后的路由 + 提供商配置）
     try:
@@ -727,10 +1703,10 @@ def single_stock_page():
         st.caption("当前模型：配置未就绪")
 
     inject_ctx = st.checkbox("将行情/回测摘要注入模型上下文", value=True)
-    user_query = st.text_area("问模型：个股/行业信息、策略建议...", value="")
+    user_query = st.text_area("问模型：个股/行业信息、策略建议..", value="")
     if user_query:
         try:
-            sys_prompt = {"role": "system", "content": "你是资深量化分析师。可以结合已知数据做基本面与技术面分析，并提醒数据来源和不构成投资建议。必要时请使用可用的联网工具（function calling）查询个股/行业实时信息，避免臆测。"}
+            sys_prompt = {"role": "system", "content": "你是资深量化分析师。可以结合已知数据做基本面与技术面分析，并提醒数据来源且不构成投资建议。必要时请使用可用的联网工具（function calling）查询个股/行业实时信息，避免臆测。"}
             messages = [sys_prompt]
             if inject_ctx and df_disp is not None and not df_disp.empty:
                 try:
@@ -799,56 +1775,7 @@ def single_stock_page():
                 _render_llm_answer(result)
         except Exception as e:
             st.error(f"调用模型失败: {e}")
-    if False and user_query:
-        try:
-            sys_prompt = {"role": "system", "content": "你是资深量化分析师。可以结合已知数据做基本面与技术面分析，并提醒数据来源和不构成投资建议。必要时请使用可用的联网工具（function calling）查询个股/行业实时信息，避免臆测。"}
-            messages = [sys_prompt]
-            if inject_ctx and df_disp is not None and not df_disp.empty:
-                try:
-                    latest_close = float(df_disp["close"].iloc[-1])
-                    latest_vol = float(df_disp["volume"].iloc[-1]) if pd.notna(df_disp["volume"].iloc[-1]) else 0
-                    ctx_lines = [
-                        f"最新收盘: {latest_close}",
-                        f"最新成交量: {latest_vol}",
-                    ]
-                    if 'df_ind' in locals():
-                        try:
-                            ctx_lines.append(f"SMA20: {float(df_ind['SMA20'].iloc[-1]):.4f}, SMA60: {float(df_ind['SMA60'].iloc[-1]):.4f}")
-                        except Exception:
-                            pass
-                    if 'res_bt' in locals() and isinstance(res_bt, dict):
-                        try:
-                            ctx_lines.append(
-                                f"回测摘要: 累计收益 {res_bt.get('return',0):.4%}, 最大回撤 {res_bt.get('max_drawdown',0):.4%}, 交易次数 {res_bt.get('trades',0)}"
-                            )
-                        except Exception:
-                            pass
-                    context_str = "\n".join(ctx_lines)
-                    messages.append({"role": "system", "content": "以下是行情与回测摘要，请结合回答问题：\n" + context_str})
-                except Exception:
-                    pass
-            user_msg = {"role": "user", "content": user_query}
-            messages.append(user_msg)
-
-            # 读取路由/模型设置
-            route_name = st.session_state.get("route_name", "default")
-            tools = get_tools_schema()
-            registry = ProviderRegistry(public_cfg_path="models.yaml", local_cfg_path="models.local.yaml")
-            router = LLMRouter(registry, route_name=route_name)
-            messages = [
-                {"role":"system","content":"你是资深行业分析师。给出条理清晰、可执行的行业研判，不构成投资建议。必要时请使用可用的联网工具（function calling）查询个股/行业实时信息。"},
-                {"role":"system","content":"当前行业上下文：\n" + "\n".join(ctx_lines)},
-                {"role":"user","content": prompt},
-            ]
-            tools = get_tools_schema()
-            result = chat_with_tools(router, messages, tools_schema=tools, max_rounds=3)
-            final_text = result.get("final_text") or ""
-            if final_text.strip():
-                st.markdown(final_text)
-            else:
-                _render_llm_answer(result)
-        except Exception as e:
-            st.error(f"行业分析失败：{e}")
+    # 旧版行业问答块（已禁用）已移除，避免与 industry_page 重复并消除潜在语法问题
     # 重复的行业分析问答块已移除（避免与 industry_page 重复，并消除未定义变量 prompt）
 
 # -------- 自选股页面 --------
@@ -892,17 +1819,396 @@ def watchlist_page():
         if c4.button("删除", key=f"wl_del_{i}_{market}_{symbol}"):
             items = [x for x in items if not ((x.get('market')==market) and (x.get('symbol')==symbol))]
             save_watchlist(items)
-            st.experimental_rerun()
+            st.rerun()
 
 
 # -------- 行业信息页面 --------
 def industry_page():
     st.header("行业信息")
-    kw = st.text_input("行业/主题关键词", value=st.session_state.get("industry_keyword", "半导体"))
+
+    # 顶部展示 5 个自选行业（可点击切换）
+    wl = load_industry_watchlist()
+    chips = st.columns(5)
+    for i in range(5):
+        with chips[i]:
+            if i < len(wl):
+                nm = wl[i]
+                if st.button(nm, key=f"ind_chip_{i}"):
+                    st.session_state["_ind_selected"] = nm
+                    st.rerun()
+            else:
+                st.write("")
+
+    with st.expander("管理自选行业", expanded=False):
+        all_inds = get_industry_list_all()
+        add_name = st.selectbox("添加行业", options=[""] + all_inds, index=0, key="_ind_add_sel")
+        c1, c2 = st.columns([1,1])
+        with c1:
+            if st.button("添加", key="btn_ind_add"):
+                if add_name and add_name.strip():
+                    if add_name not in wl:
+                        wl.append(add_name)
+                        save_industry_watchlist(wl)
+                        st.success("已添加")
+                        st.rerun()
+                    else:
+                        st.info("该行业已在自选中")
+        with c2:
+            if st.button("清空", key="btn_ind_clear"):
+                save_industry_watchlist([])
+                st.rerun()
+        if wl:
+            st.write("当前自选：")
+            for idx, nm in enumerate(list(wl)):
+                cc1, cc2, cc3, cc4 = st.columns([6,1,1,1])
+                cc1.write(nm)
+                with cc2:
+                    if st.button("上移", key=f"btn_ind_up_{idx}") and idx > 0:
+                        wl[idx-1], wl[idx] = wl[idx], wl[idx-1]
+                        save_industry_watchlist(wl)
+                        st.rerun()
+                with cc3:
+                    if st.button("下移", key=f"btn_ind_down_{idx}") and idx < len(wl)-1:
+                        wl[idx+1], wl[idx] = wl[idx], wl[idx+1]
+                        save_industry_watchlist(wl)
+                        st.rerun()
+                with cc4:
+                    if st.button("删除", key=f"btn_ind_del_{idx}"):
+                        wl2 = [x for x in wl if x != nm]
+                        save_industry_watchlist(wl2)
+                        st.rerun()
+
+    # 新增：创建/编辑自定义行业
+    with st.expander("创建/编辑自定义行业", expanded=False):
+        custom_map = load_custom_industries()
+        exist_custom_names = sorted(list(custom_map.keys())) if isinstance(custom_map, dict) else []
+        sel = st.selectbox("选择已有或新建", options=["<新建>"] + exist_custom_names, index=0, key="_cid_sel")
+        # 工作区的 session key
+        sess_key = "_cid_items" if sel == "<新建>" else f"_cid_items_{sel}"
+        # 行业名称输入
+        default_name = "" if sel == "<新建>" else sel
+        ind_name = st.text_input("行业名称", value=default_name, key=f"_cid_ind_name_{sel}")
+
+        # 初始化工作列表
+        if sess_key not in st.session_state:
+            init_items = [] if sel == "<新建>" else custom_map.get(sel, [])
+            # 基本清洗
+            clean = []
+            for it in init_items:
+                if isinstance(it, dict):
+                    sym = str(it.get("symbol", "")).strip()
+                    nm = str(it.get("name", "")).strip()
+                    if sym:
+                        clean.append({"market": str(it.get("market", "A")) or "A", "symbol": sym, "name": nm})
+            st.session_state[sess_key] = clean
+        items = st.session_state.get(sess_key, [])
+
+        st.caption("提示：A股代码建议不带交易所前缀，示例 000001、600519；保存后统计将自动抓取日线数据。")
+        c1, c2, c3 = st.columns([1.4, 1.6, 1])
+        with c1:
+            add_sym = st.text_input("代码", key=f"_cid_add_sym_{sel}")
+        with c2:
+            add_nm = st.text_input("名称", key=f"_cid_add_nm_{sel}")
+        with c3:
+            st.write("")
+            if st.button("添加成分", key=f"_cid_btn_add_{sel}"):
+                s = (add_sym or "").strip()
+                n = (add_nm or "").strip()
+                if s:
+                    # 去重按 symbol
+                    exists = {it.get("symbol") for it in items}
+                    if s not in exists:
+                        items.append({"market": "A", "symbol": s, "name": n})
+                        st.session_state[sess_key] = items
+                    else:
+                        st.info("该代码已在列表中")
+                else:
+                    st.warning("请填写代码")
+
+        # 成分股条目
+        if items:
+            st.write("当前成分：")
+            for i, it in enumerate(list(items)):
+                d1, d2, d3 = st.columns([2.5, 3, 1])
+                d1.write(str(it.get("symbol", "")))
+                d2.write(str(it.get("name", "")))
+                with d3:
+                    if st.button("删除", key=f"_cid_del_{sel}_{i}"):
+                        items.pop(i)
+                        st.session_state[sess_key] = items
+                        st.rerun()
+        else:
+            st.info("暂无成分，请先添加")
+
+        b1, b2, b3 = st.columns([1,1,1])
+        with b1:
+            if st.button("保存/更新", key=f"_cid_save_{sel}"):
+                nm = (ind_name or "").strip()
+                if not nm:
+                    st.warning("请填写行业名称")
+                else:
+                    # 写回并清理无效项
+                    uniq = []
+                    seen = set()
+                    for it in items:
+                        sym = str(it.get("symbol", "")).strip()
+                        if not sym or sym in seen:
+                            continue
+                        seen.add(sym)
+                        uniq.append({"market": "A", "symbol": sym, "name": str(it.get("name", "")).strip()})
+                    custom_map[nm] = uniq
+                    save_custom_industries(custom_map)
+                    # 清理缓存，避免统计老数据
+                    try:
+                        compute_industry_volume_metrics.clear()
+                        compute_industry_amount_metrics.clear()
+                        compute_industry_agg_series.clear()
+                        compute_industry_volume_metrics_period.clear()
+                        compute_industry_amount_metrics_period.clear()
+                    except Exception:
+                        pass
+                    st.success("已保存")
+                    st.session_state["_ind_selected"] = nm
+                    st.rerun()
+        with b2:
+            if sel != "<新建>" and st.button("删除行业", key=f"_cid_remove_{sel}"):
+                if sel in custom_map:
+                    custom_map.pop(sel, None)
+                    save_custom_industries(custom_map)
+                    try:
+                        compute_industry_volume_metrics.clear()
+                        compute_industry_amount_metrics.clear()
+                        compute_industry_agg_series.clear()
+                        compute_industry_volume_metrics_period.clear()
+                        compute_industry_amount_metrics_period.clear()
+                    except Exception:
+                        pass
+                    st.success("已删除")
+                    st.session_state.pop(sess_key, None)
+                    st.rerun()
+        with b3:
+            if st.button("清空成分股", key=f"_cid_clear_{sel}"):
+                st.session_state[sess_key] = []
+                st.rerun()
+
+    st.markdown("---")
+
+    # 行业选择 + 统计（合并“自选行业 ∪ 官方行业”，保证点击自选按钮后选项必然可选）
+    all_inds_db = get_industry_list_all()
+    # 合并去重，优先展示自选顺序
+    merged_opts: List[str] = []
+    seen = set()
+    for x in (wl + all_inds_db):
+        if x and x not in seen:
+            seen.add(x)
+            merged_opts.append(x)
+    # 若 session 中已有选择但不在列表，追加保证可选
+    curr_sel = st.session_state.get("_ind_selected")
+    if curr_sel and curr_sel not in seen:
+        merged_opts = [curr_sel] + merged_opts
+    default_ind = curr_sel or (wl[0] if wl else (merged_opts[0] if merged_opts else ""))
+    idx_default = merged_opts.index(default_ind) if (default_ind and default_ind in merged_opts) else 0
+
+    col_sel1, col_sel2, col_sel3, col_sel4 = st.columns([2,1.4,1.8,2])
+    with col_sel1:
+        if merged_opts:
+            ind = st.selectbox("选择行业", options=merged_opts, index=idx_default, key="_ind_selected")
+        else:
+            st.info("暂无行业列表，请在上方“管理自选行业”中添加，或稍后再试")
+            ind = ""
+    with col_sel2:
+        mode = st.selectbox("统计模式", options=["近N日", "时间周期"], index=0, key="_ind_stat_mode")
+        N = st.number_input("N(日)", min_value=5, max_value=250, value=20, step=5, key="_ind_N") if mode == "近N日" else None
+    with col_sel3:
+        if mode == "时间周期":
+            default_end = pd.to_datetime("today").normalize()
+            default_start = default_end - pd.Timedelta(days=30)
+            s = st.date_input("开始", value=default_start.date(), key="_ind_period_start")
+            e = st.date_input("结束", value=default_end.date(), key="_ind_period_end")
+        else:
+            s = e = None
+        show_cons = st.checkbox("显示成份股列表", value=False)
+    with col_sel4:
+        st.write("")
+        st.write("")
+
+    # 成份股列表（不依赖是否开始统计）
+    if show_cons and ind:
+        st.subheader("成份股列表")
+        try:
+            cons_preview = get_industry_cons(ind)
+        except Exception:
+            cons_preview = None
+        if cons_preview is None or cons_preview.empty:
+            st.warning("未获取到成份股数据：成份股为空或数据源暂不可用。可在上方“创建/编辑自定义行业”添加成分后再试。")
+        else:
+            st.caption(f"成份股数量：{len(cons_preview)}")
+            st.dataframe(
+                ensure_arrow_compatible(cons_preview.rename(columns={"symbol": "代码", "name": "名称"})),
+                use_container_width=True, hide_index=True, height=420
+            )
+
+    # 新增：行业统计计算触发控制，默认不自动计算，点击按钮或勾选后再执行
+    _ctrl1, _ctrl2 = st.columns([1, 1])
+    with _ctrl1:
+        _btn_calc = st.button("计算统计", key="_ind_calc_btn")
+    with _ctrl2:
+        _auto_calc = st.checkbox("自动计算", value=False, key="_ind_auto_calc")
+    _do_calc = bool(ind) and (_btn_calc or _auto_calc)
+
+    def _add_to_watchlist_if_absent(market: str, symbol: str):
+        items = load_watchlist()
+        if not any((it.get("market"), it.get("symbol")) == (market, symbol) for it in items):
+            items.append({"market": market, "symbol": symbol})
+            save_watchlist(items)
+            try:
+                st.toast(f"已加入自选：{symbol}")
+            except Exception:
+                st.success(f"已加入自选：{symbol}")
+        else:
+            try:
+                st.toast("自选中已存在")
+            except Exception:
+                st.info("自选中已存在")
+
+    if _do_calc:
+        try:
+            if mode == "近N日":
+                metrics = compute_industry_volume_metrics(ind, int(N))
+            else:
+                metrics = compute_industry_volume_metrics_period(ind, s, e)
+            curr = metrics.get("curr") or 0.0
+            yoy = metrics.get("yoy")
+            prev = metrics.get("prev")
+            yoy_pct = metrics.get("yoy_pct")
+            mom_pct = metrics.get("mom_pct")
+            leaders = metrics.get("leaders") or []
+            count = metrics.get("count")
+
+            # 成交量汇总
+            m1, m2, m3, m4, m5 = st.columns(5)
+            with m1:
+                title_v_curr = "近N日行业成交量(股)" if mode == "近N日" else "周期内行业成交量(股)"
+                st.metric(title_v_curr, f"{curr:,.0f}")
+            with m2:
+                title_v_y = "去年同期N日(股)" if mode == "近N日" else "去年同期(股)"
+                st.metric(title_v_y, "-" if yoy is None else f"{yoy:,.0f}")
+            with m3:
+                st.metric("同比", "-" if yoy_pct is None else f"{yoy_pct:.2%}")
+            with m4:
+                st.metric("环比", "-" if mom_pct is None else f"{mom_pct:.2%}")
+            with m5:
+                st.metric("成份股数", "-" if count is None else f"{int(count)}")
+
+            # 成交额统计
+            if mode == "近N日":
+                am = compute_industry_amount_metrics(ind, int(N))
+            else:
+                am = compute_industry_amount_metrics_period(ind, s, e)
+            a1, a2, a3, a4 = st.columns(4)
+            with a1:
+                title_a_curr = "近N日行业成交额(元)" if mode == "近N日" else "周期内行业成交额(元)"
+                st.metric(title_a_curr, "-" if am.get("curr") is None else f"{am.get('curr',0):,.0f}")
+            with a2:
+                title_a_y = "去年同期N日(元)" if mode == "近N日" else "去年同期(元)"
+                st.metric(title_a_y, "-" if am.get("yoy") is None else f"{am.get('yoy',0):,.0f}")
+            with a3:
+                st.metric("同比(额)", "-" if am.get("yoy_pct") is None else f"{am.get('yoy_pct'):.2%}")
+            with a4:
+                st.metric("环比(额)", "-" if am.get("mom_pct") is None else f"{am.get('mom_pct'):.2%}")
+
+            # 小型趋势图
+            tab1, tab2 = st.tabs(["成交量趋势", "成交额趋势"])
+            with tab1:
+                if mode == "近N日":
+                    ser_v = compute_industry_agg_series(ind, "volume", days=int(N))
+                else:
+                    ser_v = compute_industry_agg_series(ind, "volume", start_date=s, end_date=e)
+                if not ser_v.empty:
+                    st.line_chart(ser_v.set_index("date")[ ["volume"] ], use_container_width=True)
+                else:
+                    st.info("暂无趋势数据")
+            with tab2:
+                if mode == "近N日":
+                    ser_a = compute_industry_agg_series(ind, "amount", days=int(N))
+                else:
+                    ser_a = compute_industry_agg_series(ind, "amount", start_date=s, end_date=e)
+                if not ser_a.empty:
+                    st.line_chart(ser_a.set_index("date")[ ["amount"] ], use_container_width=True)
+                else:
+                    st.info("暂无趋势数据")
+
+            st.subheader("行业龙头（按近N日成交量，TOP5）")
+            if leaders:
+                for i, row in enumerate(leaders):
+                    code = row.get("symbol")
+                    name = row.get("name")
+                    val = row.get("curr")
+                    c1, c2, c3, c4 = st.columns([3,2,1,1])
+                    c1.write(f"{name} ({code})")
+                    c2.write(f"近N日量：{val:,.0f}")
+                    if c3.button("加自选", key=f"lead_add_{code}_{i}"):
+                        _add_to_watchlist_if_absent("A", code)
+                    if c4.button("详情", key=f"lead_view_{code}_{i}"):
+                        go_detail("A", code)
+            else:
+                st.info("暂无可识别的龙头数据")
+
+            if show_cons:
+                st.subheader("成份股列表")
+                cons = get_industry_cons(ind)
+                if cons is not None and not cons.empty:
+                    st.dataframe(
+                        ensure_arrow_compatible(cons.rename(columns={"symbol": "代码", "name": "名称"})),
+                        use_container_width=True, hide_index=True, height=420
+                    )
+                else:
+                    st.info("未获取到成份股数据")
+        except Exception as e:
+            st.warning(f"行业统计暂不可用：{e}")
+    elif ind:
+        st.info("为提升首页首屏速度，行业统计默认不自动执行。请点击上方“计算统计”或勾选“自动计算”后查看结果。")
+
+    st.markdown("---")
+
+    # 同类行业对比
+    with st.expander("同类行业对比", expanded=False):
+        # 复用上面合并后的行业列表 merged_opts
+        opts = [x for x in merged_opts if x]
+        picks = st.multiselect("选择待对比行业(<=3)", options=opts, default=[], key="_ind_compare")
+        if len(picks) > 3:
+            st.warning("最多选择 3 个行业进行对比，已自动截取前 3 个")
+            picks = picks[:3]
+        if picks:
+            cols = st.columns(len(picks))
+            for i, nm in enumerate(picks):
+                with cols[i]:
+                    st.markdown(f"#### {nm}")
+                    try:
+                        m_v = compute_industry_volume_metrics(nm, int(N))
+                        m_a = compute_industry_amount_metrics(nm, int(N))
+                        st.metric("量·近N日", f"{(m_v.get('curr') or 0):,.0f}")
+                        st.metric("量·同比", "-" if m_v.get("yoy_pct") is None else f"{m_v.get('yoy_pct'):.2%}")
+                        st.metric("量·环比", "-" if m_v.get("mom_pct") is None else f"{m_v.get('mom_pct'):.2%}")
+                        st.metric("额·近N日", f"{(m_a.get('curr') or 0):,.0f}")
+                        st.metric("额·同比", "-" if m_a.get("yoy_pct") is None else f"{m_a.get('yoy_pct'):.2%}")
+                        st.metric("额·环比", "-" if m_a.get("mom_pct") is None else f"{m_a.get('mom_pct'):.2%}")
+                        if mode == "近N日":
+                            ser = compute_industry_agg_series(nm, "volume", days=int(N))
+                        else:
+                            ser = compute_industry_agg_series(nm, "volume", start_date=s, end_date=e)
+                        if not ser.empty:
+                            st.line_chart(ser.set_index("date")[ ["volume"] ], use_container_width=True)
+                    except Exception as e:
+                        st.info(f"{nm} 统计失败：{e}")
+
+    # LLM 问答区（默认关键词使用当前选择行业）
+    kw_default = (ind or st.session_state.get("industry_keyword") or "半导体")
+    kw = st.text_input("行业/主题关键词", value=kw_default)
     st.session_state["industry_keyword"] = kw
     inject_ctx = st.checkbox("注入行业上下文", value=True)
 
-    user_query = st.text_area("问模型：行业逻辑、景气度、龙头比较、估值与风险…", value="")
+    user_query = st.text_area("问模型：行业逻辑、景气度、龙头比较、估值与风险点", value="")
     if user_query:
         try:
             sys_prompt = {"role":"system","content":"你是资深行业分析师。给出条理清晰、可执行的行业研判，不构成投资建议。必要时请使用可用的联网工具（function calling）查询个股/行业实时信息。"}
@@ -911,6 +2217,8 @@ def industry_page():
                 ctx_lines = [
                     "页面: 行业信息",
                     f"行业关键词: {kw}",
+                    f"已选行业: {ind or ''}",
+                    f"N日窗口: {int(N) if ind else ''}",
                     "如需获取成份股或个股数据，可按市场调用工具：A股用 fetch_stock_info_a，港股用 fetch_stock_info_hk。",
                 ]
                 messages.append({"role":"system","content":"以下是当前页面上下文：\n" + "\n".join(ctx_lines)})
@@ -931,7 +2239,256 @@ def industry_page():
             st.error(f"行业分析失败：{e}")
 
 
-# -------- 工具筛选页面（示例） --------
+# -------- 数据初始化页面 --------
+
+def data_init_page():
+    st.header("数据初始化 / 历史行情缓存")
+    st.caption("批量下载并缓存 A 股与港股通历史日线。支持复权方式、并发下载、失败重试、仅下载未缓存日期，以及速度/剩余时间估计。")
+
+    # 懒加载控制：进入页面不自动加载标的列表与不自动开始下载
+    col_lazy1, col_lazy2 = st.columns([1,1])
+    with col_lazy1:
+        auto_load_lists = st.checkbox("自动加载标的列表", value=False, key="auto_load_lists", help="为提升首屏速度，默认不自动加载。")
+    with col_lazy2:
+        auto_start_download = st.checkbox("自动开始下载", value=False, key="auto_start_download", help="不建议默认自动下载，避免长任务误触发。")
+
+    # 一次性自动触发开关（防止每次重绘重复执行）
+    auto_load_lists_trig = False
+    if auto_load_lists and not st.session_state.get("_auto_load_lists_done"):
+        auto_load_lists_trig = True
+        st.session_state["_auto_load_lists_done"] = True
+    auto_start_download_trig = False
+    if auto_start_download and not st.session_state.get("_auto_start_download_done"):
+        auto_start_download_trig = True
+        st.session_state["_auto_start_download_done"] = True
+
+    # 全局区间
+    today = datetime.now().date()
+    default_start = (today - timedelta(days=3650))
+    c1, c2 = st.columns(2)
+    with c1:
+        start_date = st.date_input("开始日期", value=default_start, key="init_start")
+    with c2:
+        end_date = st.date_input("结束日期", value=today, key="init_end")
+
+    # 控制项
+    c3, c4, c5, c6 = st.columns(4)
+    with c3:
+        adj_label = st.selectbox("A股复权方式", ["不复权", "前复权", "后复权"], index=0, help="仅 A 股生效")
+        adj_map = {"不复权": None, "前复权": "qfq", "后复权": "hfq"}
+        adjust = adj_map.get(adj_label)
+    with c4:
+        max_workers = st.slider("并发任务数", min_value=1, max_value=16, value=8, step=1)
+    with c5:
+        max_retries = st.slider("失败重试次数", min_value=0, max_value=5, value=2, step=1)
+    with c6:
+        skip_cached = st.checkbox("仅下载未缓存日期", value=True, help="若缓存已覆盖到结束日期则跳过；否则仅从最后缓存日期的次日开始下载并合并保存。")
+
+    show_detail = st.checkbox("显示详细日志", value=False)
+
+    st.markdown("---")
+    colA, colH = st.columns(2)
+
+    def _merge_and_save(client: AKDataClient, market: str, symbol: str, adjust: str | None, df_new: pd.DataFrame,
+                        start_date_v: datetime.date, end_date_v: datetime.date):
+        if df_new is None or df_new.empty:
+            return 0
+        # 过滤区间
+        try:
+            s = pd.to_datetime(start_date_v)
+            e = pd.to_datetime(end_date_v)
+            df_new = df_new[(df_new["date"] >= s) & (df_new["date"] <= e)]
+        except Exception:
+            pass
+        try:
+            df_old = client._load_cached_daily(market, symbol, adjust)  # type: ignore
+        except Exception:
+            df_old = pd.DataFrame()
+        if df_old is not None and not df_old.empty:
+            try:
+                df_old["date"] = pd.to_datetime(df_old["date"])
+            except Exception:
+                pass
+            merged = pd.concat([df_old, df_new], ignore_index=True)
+            merged = merged.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+            added = len(merged) - len(df_old)
+        else:
+            merged = df_new.sort_values("date")
+            added = len(merged)
+        try:
+            client._save_cached_daily(merged, market, symbol, adjust)  # type: ignore
+        except Exception:
+            pass
+        return max(0, int(added))
+
+    def _compute_fetch_window(client: AKDataClient, market: str, symbol: str, adjust: str | None,
+                              start_date_v: datetime.date, end_date_v: datetime.date):
+        # 仅用于确定起始日期，避免完全重复抓取
+        if not skip_cached:
+            return start_date_v, end_date_v
+        try:
+            df_old = client._load_cached_daily(market, symbol, adjust)  # type: ignore
+        except Exception:
+            df_old = pd.DataFrame()
+        if df_old is None or df_old.empty or "date" not in df_old.columns:
+            return start_date_v, end_date_v
+        try:
+            last_dt = pd.to_datetime(df_old["date"]).max().date()
+        except Exception:
+            return start_date_v, end_date_v
+        fetch_start = max(start_date_v, last_dt + timedelta(days=1))
+        if fetch_start > end_date_v:
+            return None, None
+        return fetch_start, end_date_v
+
+    # 通用并发执行器
+    def _run_concurrent(list_df: pd.DataFrame, market: str, adjust_for_market: str | None):
+        if list_df is None or list_df.empty:
+            st.warning("标的列表为空")
+            return
+        total = len(list_df)
+        bar = st.progress(0)
+        status = st.empty()
+        metrics = st.empty()
+        detail = st.empty() if show_detail else None
+        start_ts = time.time()
+        completed = 0
+        total_added = 0
+        errors = 0
+
+        client = get_client()
+
+        def task(symbol: str, name: str):
+            nonlocal total_added
+            t0 = time.time()
+            tries = 0
+            last_err = None
+            while tries <= max_retries:
+                try:
+                    # 计算起止，仅下载未缓存区间
+                    fw = _compute_fetch_window(client, market, symbol, adjust_for_market, start_date, end_date)
+                    if fw == (None, None):
+                        return 0, 0.0, f"已覆盖，跳过"
+                    s_fetch, e_fetch = fw
+                    # 使用统一接口，确保标准化一致
+                    df_new = client.get_hist(market=market, symbol=symbol, period="daily",
+                                             start=s_fetch.isoformat(), end=e_fetch.isoformat(),
+                                             adjust=adjust_for_market, use_cache=True, refresh=False)
+                    added = _merge_and_save(client, market, symbol, adjust_for_market, df_new, start_date, end_date)
+                    dt = time.time() - t0
+                    return added, dt, None
+                except Exception as e:
+                    last_err = e
+                    tries += 1
+                    time.sleep(min(1.5 * tries, 5))
+            return 0, time.time() - t0, str(last_err)
+
+        futures = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as exe:
+            for _, row in list_df.iterrows():
+                code = str(row.get("代码", "")).strip()
+                name = str(row.get("名称", "")).strip()
+                if not code:
+                    continue
+                futures[exe.submit(task, code, name)] = (code, name)
+
+            for fut in as_completed(futures):
+                code, name = futures[fut]
+                added, dt, err = fut.result()
+                completed += 1
+                if err:
+                    errors += 1
+                    msg = f"失败 {name}（{code}）：{err}"
+                    if detail is not None:
+                        detail.write(msg)
+                else:
+                    total_added += added
+                    if show_detail and detail is not None:
+                        detail.write(f"完成 {name}（{code}）：+{added} 行，用时 {dt:.1f}s")
+
+                # 进度与速度/ETA
+                elapsed = time.time() - start_ts
+                speed_task = completed / elapsed if elapsed > 0 else 0.0
+                eta = (total - completed) / speed_task if speed_task > 0 else 0.0
+                bar.progress(int(completed / max(1, total) * 100))
+                status.info(f"进度：{completed}/{total}，新增行：{total_added}，错误：{errors}")
+                metrics.caption(f"速度：{speed_task:.2f} 个标的/秒，预计剩余：{eta:.1f} 秒")
+
+        status.success(f"完成：共处理 {total} 个标的，新增 {total_added} 行，错误 {errors}")
+
+    with colA:
+        st.subheader("A股 初始化")
+        # 按需加载 + 会话缓存，避免初次渲染即耗时拉取
+        if st.button("加载/刷新 A股列表", key="load_list_a") or auto_load_lists_trig:
+            with st.spinner("正在加载 A股列表..."):
+                _list = get_a_stock_list_cached()
+                st.session_state["_list_a"] = _list
+            st.success("A股列表已加载")
+        list_a = st.session_state.get("_list_a")
+        tot_a = (0 if list_a is None or list_a.empty else len(list_a)) if list_a is not None else None
+        st.write(f"标的数量：{tot_a if tot_a is not None else '未加载'}")
+        if st.button("开始下载 A股", key="btn_init_a") or auto_start_download_trig:
+            if list_a is None:
+                with st.spinner("首次使用：正在加载 A股列表..."):
+                    list_a = get_a_stock_list_cached()
+                    st.session_state["_list_a"] = list_a
+            _run_concurrent(list_a, market="A", adjust_for_market=adjust)
+
+    with colH:
+        st.subheader("港股通 初始化")
+        # 新增：强制刷新缓存选项
+        force_refresh_h = st.checkbox("强制刷新缓存(港股通)", value=False, key="force_refresh_h", help="清空缓存后重新拉取港股通列表")
+        # 按需加载 + 会话缓存，避免初次渲染即耗时拉取
+        if st.button("加载/刷新 港股通列表", key="load_list_h") or auto_load_lists_trig:
+            if st.session_state.get("force_refresh_h"):
+                try:
+                    st.cache_data.clear()
+                    st.info("已清空缓存，开始重新拉取……")
+                except Exception:
+                    pass
+            with st.spinner("正在加载 港股通列表..."):
+                _list = get_hk_ggt_list_cached()
+                if _list is not None and not _list.empty and "代码" in _list.columns:
+                    _list["代码"] = (
+                        _list["代码"].astype(str).str.upper().str.replace(".HK", "", regex=False).str.lstrip("0").apply(lambda s: s.zfill(5))
+                    )
+                st.session_state["_list_h"] = _list
+            st.success("港股通列表已加载")
+            # 调试信息展示
+            try:
+                dbg_sources = st.session_state.get("_dbg_hk_ggt_sources")
+                dbg_final = st.session_state.get("_dbg_hk_ggt_final")
+                with st.expander("调试：港股通数据来源与清洗", expanded=False):
+                    if dbg_sources:
+                        st.write("来源抓取尝试：", len(dbg_sources))
+                        st.json(dbg_sources)
+                    _list_preview = st.session_state.get("_list_h")
+                    if _list_preview is not None and not _list_preview.empty:
+                        st.write("最终列表预览 (前20)：")
+                        st.dataframe(ensure_arrow_compatible(_list_preview.head(20)))
+                    if dbg_final:
+                        st.write("最终结构：")
+                        st.json(dbg_final)
+                    if not dbg_sources:
+                        st.caption("提示：若未显示来源信息，可能是缓存未刷新或上游接口无数据。可勾选‘强制刷新缓存’后重试。")
+            except Exception:
+                pass
+        list_h = st.session_state.get("_list_h")
+        tot_h = (0 if list_h is None or list_h.empty else len(list_h)) if list_h is not None else None
+        st.write(f"标的数量：{tot_h if tot_h is not None else '未加载'}")
+        if st.button("开始下载 港股通", key="btn_init_h") or auto_start_download_trig:
+            if list_h is None:
+                with st.spinner("首次使用：正在加载 港股通列表..."):
+                    list_h = get_hk_ggt_list_cached()
+                    if list_h is not None and not list_h.empty and "代码" in list_h.columns:
+                        list_h["代码"] = (
+                            list_h["代码"].astype(str).str.upper().str.replace(".HK", "", regex=False).str.lstrip("0").apply(lambda s: s.zfill(5))
+                        )
+                    st.session_state["_list_h"] = list_h
+            _run_concurrent(list_h, market="H", adjust_for_market=None)
+
+# -------- 工具筛选页面（示例）--------
+
 def tools_filter_page():
     st.header("工具筛选（示例）")
     st.info("示例：批量把 A 股代码加入自选。逗号分隔输入即可。")
@@ -954,14 +2511,14 @@ def main():
 
     with st.sidebar:
         st.header("大模型配置")
-        provider_label = st.selectbox("提供商(路由)", ["default","fast","qwen","fallback","analysis"], index=0, help="使用 routing.yaml 中的路由名", key="provider_route")
+        provider_label = st.selectbox("提供商（路由）", ["default","fast","qwen","fallback","analysis"], index=0, help="使用 routing.yaml 中的路由", key="provider_route")
         st.session_state["route_name"] = provider_label
         st.session_state["enable_tools"] = st.checkbox("启用联网工具(Function Calling)", value=True)
-        st.markdown("—")
+        st.markdown("---")
         st.header("导航")
         st.info("上次筛选/自选/查询的股票可跳转至详情页。")
 
-    tabs = st.tabs(["单股查询", "自选股", "行业信息", "工具筛选"])
+    tabs = st.tabs(["单股查询", "自选股", "行业信息", "数据初始化", "工具筛选"])
     with tabs[0]:
         single_stock_page()
     with tabs[1]:
@@ -969,7 +2526,10 @@ def main():
     with tabs[2]:
         industry_page()
     with tabs[3]:
+        data_init_page()
+    with tabs[4]:
         tools_filter_page()
 
 if __name__ == "__main__":
     main()
+
