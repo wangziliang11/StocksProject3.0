@@ -322,3 +322,6 @@ class AKDataClient:
             return self.get_a_hist(symbol=symbol, period=period, start=start, end=end, adjust=adjust, use_cache=use_cache, refresh=refresh, expire_days=expire_days)
         else:
             return self.get_hk_hist(symbol=symbol, period=period, start=start, end=end, use_cache=use_cache, refresh=refresh, expire_days=expire_days)
+
+# 创建全局实例
+ak_client = AKDataClient()

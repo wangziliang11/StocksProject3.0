@@ -158,6 +158,60 @@ def get_industry_list_all() -> List[str]:
             out.append(n)
     return out
 
+@st.cache_data(ttl=3600)
+def get_enhanced_sector_lists() -> Dict[str, List[str]]:
+    """
+    使用SectorDataManager获取增强的板块列表
+    返回包含行业板块、概念板块和全部板块的字典
+    """
+    try:
+        from src.data.sector_data_manager import SectorDataManager
+        manager = SectorDataManager()
+        sector_data = manager.get_sector_lists()
+        
+        industries = sector_data.get('industries', [])
+        concepts = sector_data.get('concepts', [])
+        
+        # 合并所有板块并去重
+        all_sectors = []
+        seen = set()
+        
+        # 先添加行业板块
+        for sector in industries:
+            if sector and sector not in seen:
+                seen.add(sector)
+                all_sectors.append(sector)
+        
+        # 再添加概念板块
+        for sector in concepts:
+            if sector and sector not in seen:
+                seen.add(sector)
+                all_sectors.append(sector)
+        
+        # 添加自定义板块
+        custom = load_custom_industries()
+        for sector in custom.keys():
+            if sector and sector not in seen:
+                seen.add(sector)
+                all_sectors.append(sector)
+        
+        return {
+            'industries': industries,
+            'concepts': concepts,
+            'all': all_sectors,
+            'custom': list(custom.keys())
+        }
+    except Exception as e:
+        st.warning(f"获取增强板块列表失败，使用备用方案: {e}")
+        # 回退到原有方案
+        base_list = get_industry_list_all()
+        return {
+            'industries': base_list,
+            'concepts': [],
+            'all': base_list,
+            'custom': []
+        }
+
 # 统一成份股：优先自定义（仅当有效），否则回退官方
 def get_industry_cons(industry_name: str) -> pd.DataFrame:
     custom = load_custom_industries()
@@ -321,6 +375,43 @@ def ak_get_industry_list() -> List[str]:
 
 @st.cache_data(ttl=1800)
 def ak_get_industry_cons(industry_name: str) -> pd.DataFrame:
+    """通过 AKShare 获取行业成分股（使用新的数据管理器）"""
+    if not industry_name:
+        return pd.DataFrame()
+    
+    try:
+        # 使用新的板块数据管理器
+        from src.data.sector_data_manager import SectorDataManager
+        sector_manager = SectorDataManager()
+        
+        # 获取成分股数据
+        df = sector_manager.get_sector_constituents(industry_name, sector_type="auto")
+        
+        if df is not None and not df.empty:
+            # 转换为原有格式
+            result = pd.DataFrame()
+            result['symbol'] = df['code']
+            result['name'] = df['name']
+            return result
+        else:
+            # 如果获取失败，尝试备用数据
+            fallback_df = sector_manager.get_fallback_constituents(industry_name)
+            if not fallback_df.empty:
+                result = pd.DataFrame()
+                result['symbol'] = fallback_df['code']
+                result['name'] = fallback_df['name']
+                st.info(f"使用备用数据获取板块 '{industry_name}' 成分股")
+                return result
+    
+    except Exception as e:
+        st.warning(f"板块数据管理器获取失败: {e}")
+        # 回退到原有逻辑
+        return _ak_get_industry_cons_fallback(industry_name)
+    
+    return pd.DataFrame()
+
+def _ak_get_industry_cons_fallback(industry_name: str) -> pd.DataFrame:
+    """原有的AKShare获取逻辑（作为备用）"""
     import akshare as ak
     df = pd.DataFrame()
     # 先尝试：同花顺 行业板块成份（名称->代码->成份）
@@ -2163,11 +2254,52 @@ def _frag_industry_stats(ind: str):
             s = e = None
         show_cons = st.checkbox("显示成份股列表", value=False, key=f"frag_ind_show_cons_{ind}")
 
-    _c1, _c2 = st.columns([1, 1])
-    with _c1:
+    # 成分股管理区域
+    st.subheader("📊 板块统计与成分股管理")
+    
+    col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+    with col1:
         trig = st.button("计算统计", key=f"frag_ind_calc_btn_{ind}")
-    with _c2:
+    with col2:
         auto = st.checkbox("自动计算", value=False, key=f"frag_ind_auto_calc_{ind}")
+    with col3:
+        # 更新成分股按钮
+        if st.button("🔄 更新成分股", key=f"frag_update_cons_{ind}"):
+            try:
+                from src.data.sector_component_cache import sector_component_cache
+                success = sector_component_cache.update_sector_components(ind)
+                if success:
+                    st.success(f"成功更新板块 {ind} 的成分股数据")
+                    st.rerun()
+                else:
+                    st.warning(f"更新板块 {ind} 成分股数据失败")
+            except Exception as e:
+                st.error(f"更新成分股失败: {e}")
+    with col4:
+        # 显示缓存状态
+        try:
+            from src.data.sector_component_cache import sector_component_cache
+            cache_info = sector_component_cache.get_cache_info(ind)
+            if cache_info:
+                is_valid = cache_info.get('is_valid', False)
+                last_update = cache_info.get('last_update', '')
+                if last_update:
+                    from datetime import datetime
+                    try:
+                        update_time = datetime.fromisoformat(last_update)
+                        time_str = update_time.strftime('%m-%d %H:%M')
+                    except:
+                        time_str = last_update[:16]
+                else:
+                    time_str = '未知'
+                
+                status = "✅ 有效" if is_valid else "⚠️ 过期"
+                st.caption(f"缓存: {status}")
+                st.caption(f"更新: {time_str}")
+            else:
+                st.caption("缓存: ❌ 无缓存")
+        except Exception:
+            st.caption("缓存: ❓ 未知")
 
     if not (trig or auto):
         st.caption("提示：点击“计算统计”或勾选“自动计算”开始，操作仅刷新本区块。")
@@ -2190,11 +2322,19 @@ def _frag_industry_stats(ind: str):
                 st.info("自选中已存在")
 
     try:
-        # 成交量统计
+        # 成交量统计（使用优化版本）
+        from src.ui.optimized_industry_calculations import (
+            compute_industry_volume_metrics_cached,
+            compute_industry_volume_metrics_period_cached,
+            compute_industry_amount_metrics_cached,
+            compute_industry_amount_metrics_period_cached,
+            compute_industry_agg_series_cached
+        )
+        
         if mode == "近N日":
-            metrics = compute_industry_volume_metrics(ind, int(N))
+            metrics = compute_industry_volume_metrics_cached(ind, int(N))
         else:
-            metrics = compute_industry_volume_metrics_period(ind, s, e)
+            metrics = compute_industry_volume_metrics_period_cached(ind, s, e)
         curr = metrics.get("curr") or 0.0
         yoy = metrics.get("yoy")
         yoy_pct = metrics.get("yoy_pct")
@@ -2221,11 +2361,11 @@ def _frag_industry_stats(ind: str):
             st.info("当前板块暂无成份股或数据为空，已跳过趋势与龙头展示。")
             return
 
-        # 成交额统计
+        # 成交额统计（使用优化版本）
         if mode == "近N日":
-            am = compute_industry_amount_metrics(ind, int(N))
+            am = compute_industry_amount_metrics_cached(ind, int(N))
         else:
-            am = compute_industry_amount_metrics_period(ind, s, e)
+            am = compute_industry_amount_metrics_period_cached(ind, s, e)
         a1, a2, a3, a4 = st.columns(4)
         with a1:
             title_a_curr = (f"近{int(N)}日板块成交额" if mode == "近N日" else "周期内板块成交额")
@@ -2238,16 +2378,16 @@ def _frag_industry_stats(ind: str):
         with a4:
             st.metric("环比(额)", "-" if am.get("mom_pct") is None else f"{am.get('mom_pct'):.2%}")
 
-        # 趋势图
+        # 趋势图（使用优化版本）
         tab1, tab2 = st.tabs(["成交量趋势", "成交额趋势"])
         with tab1:
-            ser_v = compute_industry_agg_series(ind, "volume", days=int(N)) if mode == "近N日" else compute_industry_agg_series(ind, "volume", start_date=s, end_date=e)
+            ser_v = compute_industry_agg_series_cached(ind, "volume", days=int(N)) if mode == "近N日" else compute_industry_agg_series_cached(ind, "volume", start_date=s, end_date=e)
             if not ser_v.empty:
                 st.line_chart(ser_v.set_index("date")[ ["volume"] ], use_container_width=True)
             else:
                 st.info("暂无趋势数据")
         with tab2:
-            ser_a = compute_industry_agg_series(ind, "amount", days=int(N)) if mode == "近N日" else compute_industry_agg_series(ind, "amount", start_date=s, end_date=e)
+            ser_a = compute_industry_agg_series_cached(ind, "amount", days=int(N)) if mode == "近N日" else compute_industry_agg_series_cached(ind, "amount", start_date=s, end_date=e)
             if not ser_a.empty:
                 st.line_chart(ser_a.set_index("date")[ ["amount"] ], use_container_width=True)
             else:
@@ -2270,7 +2410,15 @@ def _frag_industry_stats(ind: str):
 
         if show_cons:
             st.subheader("成份股列表")
-            cons = get_industry_cons(ind)
+            
+            # 获取成分股数据（优先使用缓存）
+            try:
+                from src.data.sector_component_cache import sector_component_cache
+                cons = sector_component_cache.get_sector_components(ind)
+            except Exception as e:
+                st.warning(f"从缓存获取成分股失败，使用原有方式: {e}")
+                cons = get_industry_cons(ind)
+            
             if cons is not None and not cons.empty:
                 st.dataframe(
                     ensure_arrow_compatible(cons.rename(columns={"symbol": "代码", "name": "名称"})),
@@ -2390,8 +2538,29 @@ def industry_page():
                 st.write("")
 
     with st.expander("管理自选板块", expanded=False):
-        all_inds = get_industry_list_all()
-        add_name = st.selectbox("添加板块", options=[""] + all_inds, index=0, key="_ind_add_sel")
+        # 添加板块类型选择
+        sector_type = st.radio(
+            "板块类型", 
+            options=["全部", "行业板块", "概念板块"], 
+            horizontal=True,
+            key="_sector_type_filter"
+        )
+        
+        # 获取增强的板块列表
+        enhanced_lists = get_enhanced_sector_lists()
+        
+        # 根据选择的类型过滤板块
+        if sector_type == "行业板块":
+            available_sectors = enhanced_lists['industries']
+        elif sector_type == "概念板块":
+            available_sectors = enhanced_lists['concepts']
+        else:  # 全部
+            available_sectors = enhanced_lists['all']
+        
+        # 显示板块数量信息
+        st.caption(f"可选板块数量: {len(available_sectors)} ({sector_type})")
+        
+        add_name = st.selectbox("添加板块", options=[""] + available_sectors, index=0, key="_ind_add_sel")
         c1, c2 = st.columns([1,1])
         with c1:
             if st.button("添加", key="btn_ind_add"):
@@ -2544,7 +2713,7 @@ def industry_page():
     st.markdown("---")
 
     # 行业选择 + 统计（合并“自选行业 ∪ 官方行业”，保证点击自选按钮后选项必然可选）
-    all_inds_db = get_industry_list_all()
+    all_inds_db = get_enhanced_sector_lists()['all']  # 使用增强的板块列表
     # 合并去重，优先展示自选顺序
     merged_opts: List[str] = []
     seen = set()
@@ -2563,11 +2732,32 @@ def industry_page():
     with col_sel1:
         if merged_opts:
             ind = st.selectbox("选择板块", options=merged_opts, index=idx_default, key="_ind_selected")
+            # 显示板块类型信息
+            if ind:
+                enhanced_lists = get_enhanced_sector_lists()
+                sector_info = ""
+                if ind in enhanced_lists['industries']:
+                    sector_info = "行业板块"
+                elif ind in enhanced_lists['concepts']:
+                    sector_info = "概念板块"
+                elif ind in enhanced_lists['custom']:
+                    sector_info = "自定义板块"
+                if sector_info:
+                    st.caption(f"类型: {sector_info}")
         else:
             st.info("暂无板块列表，请在上方“管理自选板块”中添加，或稍后再试")
             ind = ""
     with col_sp2:
-        st.caption("统计控制与成份列表已移至下方异步片段")
+        # 显示板块统计信息
+        if merged_opts:
+            enhanced_lists = get_enhanced_sector_lists()
+            st.caption(f"可选板块: {len(merged_opts)}")
+            st.caption(f"行业板块: {len(enhanced_lists['industries'])}")
+            st.caption(f"概念板块: {len(enhanced_lists['concepts'])}")
+            if enhanced_lists['custom']:
+                st.caption(f"自定义板块: {len(enhanced_lists['custom'])}")
+        else:
+            st.caption("统计控制与成份列表已移至下方异步片段")
     with col_sp3:
         st.write("")
     with col_sp4:

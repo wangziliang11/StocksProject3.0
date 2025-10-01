@@ -1,0 +1,12 @@
+{
+  "固态电池": {
+    "last_update": "2025-09-30T23:01:04.079490",
+    "component_count": 217,
+    "update_source": "sector_data_manager"
+  },
+  "液冷服务器": {
+    "last_update": "2025-10-01T09:43:42.243625",
+    "component_count": 7,
+    "update_source": "sector_data_manager"
+  }
+}
